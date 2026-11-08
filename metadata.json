@@ -1,0 +1,6 @@
+{
+  "name": "WiFive Pro Studio - Editor de Cortes e Molduras HD",
+  "description": "Ferramenta avançada de molduras em lote, corte e remoção de bordas, limpeza de metadados, efeitos visuais, áudio de fundo e exportação MP4 em alta definição.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
