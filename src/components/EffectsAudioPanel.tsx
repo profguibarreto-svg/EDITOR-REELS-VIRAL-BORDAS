@@ -15,8 +15,8 @@ import {
   Volume2,
   Volume1,
   Upload,
-  Play,
   RotateCcw,
+  VolumeX,
 } from 'lucide-react';
 import { PRESET_TRACKS } from '../utils/audioTracks';
 
@@ -27,6 +27,7 @@ interface EffectsAudioPanelProps {
   onUpdateAudio: (updated: Partial<AudioSettings>) => void;
   exportSettings: ExportSettings;
   onUpdateExportSettings: (updated: Partial<ExportSettings>) => void;
+  section?: 'all' | 'effects' | 'audio';
 }
 
 export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
@@ -36,6 +37,7 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
   onUpdateAudio,
   exportSettings,
   onUpdateExportSettings,
+  section = 'all',
 }) => {
   const audioInputRef = useRef<HTMLInputElement>(null);
 
@@ -47,8 +49,19 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
         customAudioUrl: url,
         customAudioName: file.name,
         bgmTrackId: 'custom',
+        bgmVolume: audioSettings.bgmVolume === 0 ? 0.25 : audioSettings.bgmVolume,
       });
     }
+    e.target.value = '';
+  };
+
+  const handleRemoveBgm = () => {
+    onUpdateAudio({
+      bgmTrackId: 'none',
+      customAudioUrl: null,
+      customAudioName: null,
+      bgmVolume: 0,
+    });
   };
 
   const resetEffects = () => {
@@ -72,10 +85,15 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
     { label: '2.0x', value: 2.0 },
   ];
 
+  const showEffects = section === 'all' || section === 'effects';
+  const showAudio = section === 'all' || section === 'audio';
+  const showSpeedAndMeta = section === 'all';
+
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-6">
       {/* 1. VISUAL EFFECTS */}
-      <div className="space-y-4 pb-5 border-b border-slate-800">
+      {showEffects && (
+      <div className={`space-y-4 ${showAudio || showSpeedAndMeta ? 'pb-5 border-b border-slate-800' : ''}`}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400">
@@ -199,8 +217,10 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
           </div>
         </div>
       </div>
+      )}
 
       {/* 2. SPEED CONTROL */}
+      {showSpeedAndMeta && (
       <div className="space-y-3 pb-5 border-b border-slate-800">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -238,10 +258,12 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
           ))}
         </div>
       </div>
+      )}
 
       {/* 3. BACKGROUND MUSIC & AUDIO MIXING */}
-      <div className="space-y-4 pb-5 border-b border-slate-800">
-        <div className="flex items-center justify-between">
+      {showAudio && (
+      <div className={`space-y-4 ${showSpeedAndMeta ? 'pb-5 border-b border-slate-800' : ''}`}>
+        <div className="flex items-center justify-between flex-wrap gap-2">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
               <Music className="w-4 h-4" />
@@ -253,6 +275,16 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
               </p>
             </div>
           </div>
+          {(audioSettings.bgmTrackId !== 'none' || audioSettings.customAudioUrl || audioSettings.bgmVolume > 0) && (
+            <button
+              type="button"
+              onClick={handleRemoveBgm}
+              className="px-2.5 py-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 text-[11px] font-bold flex items-center gap-1.5 transition"
+            >
+              <VolumeX className="w-3.5 h-3.5" />
+              Remover Música de Fundo
+            </button>
+          )}
         </div>
 
         {/* Volume Sliders (Original Voice vs BGM Track) */}
@@ -350,8 +382,10 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
           </div>
         </div>
       </div>
+      )}
 
       {/* 4. METADATA STRIPPING (ANTI-SHADOWBAN) */}
+      {showSpeedAndMeta && (
       <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
@@ -377,6 +411,7 @@ export const EffectsAudioPanel: React.FC<EffectsAudioPanelProps> = ({
           className="w-4 h-4 accent-emerald-500 rounded cursor-pointer"
         />
       </div>
+      )}
     </div>
   );
 };

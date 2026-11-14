@@ -19,6 +19,8 @@ import {
 } from 'lucide-react';
 
 interface FrameEditorProps {
+  frameEnabled: boolean;
+  onToggleFrameEnabled: (enabled: boolean) => void;
   frameStyle: FrameStyle;
   onSelectFrameStyle: (style: FrameStyle) => void;
   brand: ProfileBrand;
@@ -26,6 +28,8 @@ interface FrameEditorProps {
 }
 
 export const FrameEditor: React.FC<FrameEditorProps> = ({
+  frameEnabled,
+  onToggleFrameEnabled,
   frameStyle,
   onSelectFrameStyle,
   brand,
@@ -40,6 +44,7 @@ export const FrameEditor: React.FC<FrameEditorProps> = ({
       const url = URL.createObjectURL(file);
       onUpdateBrand({ avatarUrl: url });
     }
+    e.target.value = '';
   };
 
   const handleCustomFrameUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -48,7 +53,9 @@ export const FrameEditor: React.FC<FrameEditorProps> = ({
       const url = URL.createObjectURL(file);
       onUpdateBrand({ customFrameUrl: url });
       onSelectFrameStyle('custom');
+      onToggleFrameEnabled(true);
     }
+    e.target.value = '';
   };
 
   const framePresets: { id: FrameStyle; label: string; icon: React.ReactNode; desc: string; tag?: string }[] = [
@@ -106,8 +113,8 @@ export const FrameEditor: React.FC<FrameEditorProps> = ({
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-6">
-      {/* Title */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+      {/* Title & Frame On/Off Switch */}
+      <div className="flex items-center justify-between pb-3 border-b border-slate-800 gap-3 flex-wrap">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
             <Sparkles className="w-4 h-4" />
@@ -117,10 +124,35 @@ export const FrameEditor: React.FC<FrameEditorProps> = ({
             <p className="text-[11px] text-slate-400">Personalize o visual que aparecerá nos cortes</p>
           </div>
         </div>
+
+        <label className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer hover:border-slate-700 transition text-xs">
+          <span className={`font-bold ${frameEnabled ? 'text-emerald-400' : 'text-slate-400'}`}>
+            {frameEnabled ? 'Moldura Ativada' : 'Moldura Desativada'}
+          </span>
+          <input
+            type="checkbox"
+            checked={frameEnabled}
+            onChange={(e) => onToggleFrameEnabled(e.target.checked)}
+            className="w-4 h-4 accent-emerald-500 rounded cursor-pointer"
+          />
+        </label>
       </div>
 
+      {!frameEnabled && (
+        <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 text-xs text-slate-300 flex items-center justify-between gap-3">
+          <span>A moldura está desativada para este vídeo. Apenas recorte, efeitos visuais e áudio serão aplicados.</span>
+          <button
+            type="button"
+            onClick={() => onToggleFrameEnabled(true)}
+            className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold whitespace-nowrap transition"
+          >
+            Ativar Moldura
+          </button>
+        </div>
+      )}
+
       {/* Frame Style Selector Grid */}
-      <div>
+      <div className={!frameEnabled ? 'opacity-45 pointer-events-none' : ''}>
         <label className="text-xs font-semibold text-slate-300 block mb-2.5">
           Estilo da Moldura:
         </label>
@@ -230,7 +262,16 @@ export const FrameEditor: React.FC<FrameEditorProps> = ({
               </button>
               <div>
                 <span className="text-xs font-bold text-white block">Logo da Página</span>
-                <span className="text-[11px] text-slate-400">PNG ou JPG (redonda)</span>
+                <span className="text-[11px] text-slate-400 block">PNG ou JPG (redonda)</span>
+                {brand.avatarUrl && (
+                  <button
+                    type="button"
+                    onClick={() => onUpdateBrand({ avatarUrl: null })}
+                    className="text-[10px] text-red-400 hover:text-red-300 font-semibold mt-0.5"
+                  >
+                    Remover logo
+                  </button>
+                )}
               </div>
             </div>
 
@@ -425,7 +466,7 @@ export const FrameEditor: React.FC<FrameEditorProps> = ({
             </div>
 
             {/* Position & Scale Sliders */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800 text-xs">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800 text-xs">
               <div>
                 <div className="flex justify-between text-slate-300 mb-1">
                   <span>Posição Vertical (Y):</span>
@@ -440,6 +481,24 @@ export const FrameEditor: React.FC<FrameEditorProps> = ({
                   step={1}
                   value={brand.framePositionY !== undefined ? brand.framePositionY : 2.5}
                   onChange={(e) => onUpdateBrand({ framePositionY: parseFloat(e.target.value) })}
+                  className="w-full accent-blue-500 cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between text-slate-300 mb-1">
+                  <span>Posição Horiz. (X):</span>
+                  <span className="font-mono font-bold text-blue-400">
+                    {Math.round(brand.framePositionX !== undefined ? brand.framePositionX : 50)}%
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={brand.framePositionX !== undefined ? brand.framePositionX : 50}
+                  onChange={(e) => onUpdateBrand({ framePositionX: parseFloat(e.target.value) })}
                   className="w-full accent-blue-500 cursor-pointer"
                 />
               </div>

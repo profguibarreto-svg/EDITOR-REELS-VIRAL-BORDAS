@@ -10,8 +10,15 @@ import {
   Film,
   Music,
   Scissors,
-  CheckCircle2
+  CheckCircle2,
+  Code2,
+  FileArchive,
 } from 'lucide-react';
+import {
+  downloadLinuxPackage,
+  downloadSourceCodeZip,
+  downloadSourceCodeTxt,
+} from '../utils/exportZip';
 
 interface DocumentationModalProps {
   isOpen: boolean;
@@ -19,7 +26,7 @@ interface DocumentationModalProps {
 }
 
 export const DocumentationModal: React.FC<DocumentationModalProps> = ({ isOpen, onClose }) => {
-  const [activeTab, setActiveTab] = useState<'analise' | 'performance' | 'seguranca' | 'novidades'>('novidades');
+  const [activeTab, setActiveTab] = useState<'analise' | 'performance' | 'seguranca' | 'novidades' | 'linux' | 'codigo'>('novidades');
 
   if (!isOpen) return null;
 
@@ -108,6 +115,30 @@ export const DocumentationModal: React.FC<DocumentationModalProps> = ({ isOpen, 
           >
             <ShieldCheck className="w-4 h-4 text-purple-400" />
             Segurança & Privacidade
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('linux')}
+            className={`py-3 px-3 font-semibold border-b-2 flex items-center gap-2 transition whitespace-nowrap ${
+              activeTab === 'linux'
+                ? 'border-emerald-500 text-emerald-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Download className="w-4 h-4 text-emerald-400" />
+            Instalar no Linux Mint
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('codigo')}
+            className={`py-3 px-3 font-semibold border-b-2 flex items-center gap-2 transition whitespace-nowrap ${
+              activeTab === 'codigo'
+                ? 'border-cyan-500 text-cyan-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Code2 className="w-4 h-4 text-cyan-400" />
+            Código Fonte Geral
           </button>
         </div>
 
@@ -258,6 +289,111 @@ export const DocumentationModal: React.FC<DocumentationModalProps> = ({ isOpen, 
                 <p className="text-xs text-slate-300">
                   Ao re-renderizar cada frame do clipe, o container final nasce sem metadados residuais da câmera, eliminando identificadores como número de série do aparelho, localização GPS ou data/hora original da gravação.
                 </p>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'linux' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-bold text-white flex items-center gap-2">
+                    Programa para Linux Mint / Ubuntu
+                    <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                      Sem Travamentos
+                    </span>
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Execute o programa 100% offline direto na sua máquina Linux com desempenho máximo.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => downloadLinuxPackage()}
+                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-2 shadow-lg transition active:scale-95 cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  Baixar Pacote Linux (.zip)
+                </button>
+              </div>
+
+              <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 space-y-3 font-mono text-xs">
+                <div className="text-slate-400 font-sans font-semibold">Instruções para executar no Linux Mint:</div>
+                <div className="text-emerald-400"># 1. Extraia o arquivo baixado e abra o terminal na pasta:</div>
+                <div className="bg-slate-900 p-2 rounded text-slate-200">cd ~/Downloads/wifive-pro-studio-linux</div>
+                <div className="text-emerald-400"># 2. Execute o inicializador automático (ele faz tudo sozinho):</div>
+                <div className="bg-slate-900 p-2 rounded text-slate-200">./iniciar.sh</div>
+                <div className="text-slate-400 font-sans text-xs">
+                  O script instala as dependências automaticamente, cria um atalho na Área de Trabalho e abre o navegador em <strong>http://localhost:3000</strong>.
+                </div>
+              </div>
+
+              <div className="p-4 rounded-xl bg-blue-950/30 border border-blue-500/30 space-y-2 text-xs">
+                <div className="font-bold text-blue-300">💡 Precisa instalar o Node.js no Linux Mint?</div>
+                <p className="text-slate-300">
+                  Se ainda não tiver o Node.js no sistema, basta rodar uma única vez:
+                </p>
+                <div className="bg-slate-900 p-2 rounded text-blue-200 font-mono">
+                  sudo apt update && sudo apt install -y nodejs npm
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'codigo' && (
+            <div className="space-y-4">
+              <div>
+                <h3 className="text-base font-bold text-white flex items-center gap-2">
+                  Código Fonte Geral do WiFive Pro Studio
+                  <span className="text-xs px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                    28 arquivos
+                  </span>
+                </h3>
+                <p className="text-xs text-slate-400 mt-1">
+                  Baixe todo o código-fonte do projeto em arquivo único consolidado (.txt) ou em pacote completo estruturado (.zip).
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="p-4 rounded-xl bg-slate-950/80 border border-cyan-500/30 flex flex-col justify-between gap-3">
+                  <div>
+                    <div className="font-bold text-cyan-300 flex items-center gap-2">
+                      <FileText className="w-4 h-4" />
+                      Arquivo Único (.txt)
+                    </div>
+                    <p className="text-xs text-slate-300 mt-1">
+                      Todo o código-fonte de todos os 28 arquivos reunidos em um único documento <strong>CODIGO_FONTE_GERAL.txt</strong> com índice completo.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => downloadSourceCodeTxt()}
+                    className="w-full py-2 px-3 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    Baixar CODIGO_FONTE_GERAL.txt
+                  </button>
+                </div>
+
+                <div className="p-4 rounded-xl bg-slate-950/80 border border-indigo-500/30 flex flex-col justify-between gap-3">
+                  <div>
+                    <div className="font-bold text-indigo-300 flex items-center gap-2">
+                      <FileArchive className="w-4 h-4" />
+                      Projeto Completo (.zip)
+                    </div>
+                    <p className="text-xs text-slate-300 mt-1">
+                      Estrutura completa de pastas (<code>src/</code>, <code>package.json</code>, <code>vite.config.ts</code>, <code>servidor.mjs</code>, etc.) pronta para editar.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => downloadSourceCodeZip()}
+                    className="w-full py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    Baixar Código Fonte (.zip)
+                  </button>
+                </div>
               </div>
             </div>
           )}

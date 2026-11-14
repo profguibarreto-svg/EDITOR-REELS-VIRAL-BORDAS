@@ -1,9 +1,8 @@
 import React, { useRef, useState } from 'react';
-import { VideoQueueItem } from '../types/video';
+import { VideoProjectSettings, VideoQueueItem } from '../types/video';
 import {
   Upload,
   Play,
-  CheckCircle2,
   AlertCircle,
   Loader2,
   Download,
@@ -11,43 +10,56 @@ import {
   FileArchive,
   Film,
   Sparkles,
-  Scissors,
   Type,
   ListOrdered,
   X,
+  Edit3,
+  RotateCcw,
 } from 'lucide-react';
 import { formatTime } from '../utils/geometryMath';
+import { downloadLinuxPackage } from '../utils/exportZip';
+import { getModifiedSections } from '../utils/projectSettings';
 
 interface BatchQueueProps {
   queue: VideoQueueItem[];
   activeId: string | null;
+  globalSettings: VideoProjectSettings;
   onSelectVideo: (id: string) => void;
+  onEditVideo: (id: string) => void;
   onAddFiles: (files: FileList | File[]) => void;
   onRemoveVideo: (id: string) => void;
   onProcessAll: () => void;
+  onProcessSingle: (id: string) => void;
   onCancelProcess: () => void;
   isProcessing: boolean;
+  batchProgress: { current: number; total: number; currentName: string } | null;
   onDownloadSingle: (item: VideoQueueItem) => void;
   onDownloadZip: () => void;
   onLoadDemoSample: () => void;
   onUpdateItemHeadline?: (id: string, headline: string) => void;
   onBatchSetHeadlines?: (headlines: string[]) => void;
+  detectedFormatLabel: string;
 }
 
 export const BatchQueue: React.FC<BatchQueueProps> = ({
   queue,
   activeId,
+  globalSettings,
   onSelectVideo,
+  onEditVideo,
   onAddFiles,
   onRemoveVideo,
   onProcessAll,
+  onProcessSingle,
   onCancelProcess,
   isProcessing,
+  batchProgress,
   onDownloadSingle,
   onDownloadZip,
   onLoadDemoSample,
   onUpdateItemHeadline,
   onBatchSetHeadlines,
+  detectedFormatLabel,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [showBatchTitlesModal, setShowBatchTitlesModal] = useState<boolean>(false);
@@ -57,6 +69,7 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
     if (e.target.files && e.target.files.length > 0) {
       onAddFiles(e.target.files);
     }
+    e.target.value = '';
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -77,7 +90,7 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
     setShowBatchTitlesModal(false);
   };
 
-  const completedCount = queue.filter((i) => i.status === 'done').length;
+  const completedCount = queue.filter((i) => i.status === 'done' && i.outputBlob).length;
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-5">
@@ -95,7 +108,7 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
               </span>
             </h2>
             <p className="text-[11px] text-slate-400">
-              Arraste múltiplos cortes para aplicar a moldura em todos
+              Clique em "EDITAR VÍDEO" para personalizar cada corte de forma independente
             </p>
           </div>
         </div>
@@ -106,8 +119,9 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
             <button
               type="button"
               onClick={() => {
-                // Pre-fill existing headlines into textarea
-                const existing = queue.map((v) => v.customHeadline || '').join('\n');
+                const existing = queue
+                  .map((v) => v.customHeadline || v.settings?.brand.headline || '')
+                  .join('\n');
                 setLinesText(existing);
                 setShowBatchTitlesModal(true);
               }}
@@ -118,18 +132,72 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
             </button>
           )}
 
-          {/* Demo Button if empty */}
-          {queue.length === 0 && (
-            <button
-              type="button"
-              onClick={onLoadDemoSample}
-              className="px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold flex items-center gap-1.5 transition"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-              Carregar Vídeo de Exemplo
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onLoadDemoSample}
+            disabled={isProcessing}
+            className="px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-50"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+            {queue.length === 0 ? 'Carregar Vídeo de Exemplo' : '+ Vídeo Exemplo'}
+          </button>
         </div>
+      </div>
+
+      {/* Overall Batch Progress Bar */}
+      {isProcessing && batchProgress && (
+        <div className="p-3.5 rounded-xl bg-blue-950/40 border border-blue-500/40 space-y-2">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-bold text-blue-200 flex items-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
+              Processando lote ({batchProgress.current} de {batchProgress.total}):{' '}
+              <span className="text-white truncate max-w-[180px] sm:max-w-[260px]">
+                {batchProgress.currentName}
+              </span>
+            </span>
+            <span className="font-mono text-blue-300 font-bold">
+              {Math.round((batchProgress.current / Math.max(1, batchProgress.total)) * 100)}%
+            </span>
+          </div>
+          <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-300"
+              style={{
+                width: `${Math.round(
+                  ((batchProgress.current - 1) / Math.max(1, batchProgress.total)) * 100
+                )}%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Linux Mint Download Banner */}
+      <div className="p-3 rounded-xl bg-gradient-to-r from-emerald-950/40 via-slate-900 to-teal-950/40 border border-emerald-500/30 flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center border border-emerald-500/30">
+            <Download className="w-4 h-4" />
+          </div>
+          <div>
+            <div className="text-xs font-bold text-white flex items-center gap-2">
+              Programa para Linux Mint
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">
+                .zip
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-300">
+              Execute no seu PC com o script <code className="text-emerald-400 font-mono">./iniciar.sh</code>
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => downloadLinuxPackage()}
+          className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md transition active:scale-95 cursor-pointer ml-auto"
+        >
+          <Download className="w-3.5 h-3.5" />
+          Baixar Arquivo Linux (.zip)
+        </button>
       </div>
 
       {/* Upload Dropzone */}
@@ -137,7 +205,7 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="video/mp4,video/quicktime,video/webm,video/x-matroska"
+        accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/*"
         onChange={handleFileChange}
         className="hidden"
       />
@@ -152,36 +220,42 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
           <Upload className="w-5 h-5" />
         </div>
         <p className="text-xs font-bold text-white">
-          Toque para escolher os vídeos ou arraste a pasta inteira
+          Toque para escolher os vídeos ou arraste vários arquivos aqui
         </p>
         <p className="text-[10px] text-slate-400 mt-1">
-          Suporta MP4, MOV, WebM em lote · Processamento 100% no seu dispositivo
+          Suporta MP4, MOV, WebM em lote · Edição 100% independente por vídeo
         </p>
       </div>
 
       {/* Video List */}
       {queue.length > 0 && (
-        <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
+        <div className="space-y-2.5 max-h-[460px] overflow-y-auto pr-1">
           {queue.map((item, idx) => {
             const isSelected = item.id === activeId;
+            const modifiedSections = getModifiedSections(item, globalSettings);
+            const itemRes = item.settings?.exportSettings?.resolution || globalSettings.exportSettings.resolution;
+            const itemRatio = item.settings?.exportSettings?.aspectRatio || globalSettings.exportSettings.aspectRatio;
+            const itemExt =
+              item.outputExtension || (item.outputBlob?.type.includes('mp4') ? 'mp4' : 'webm');
+
             return (
               <div
                 key={item.id}
                 onClick={() => onSelectVideo(item.id)}
-                className={`p-3 rounded-xl border flex flex-col gap-2 cursor-pointer transition ${
+                className={`p-3 rounded-xl border flex flex-col gap-2.5 cursor-pointer transition ${
                   isSelected
                     ? 'bg-blue-600/15 border-blue-500/70 ring-1 ring-blue-500/30 text-white'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700 hover:bg-slate-850'
+                    : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
                 }`}
               >
-                <div className="flex items-center justify-between gap-3">
+                <div className="flex items-start justify-between gap-3 flex-wrap sm:flex-nowrap">
                   {/* Thumbnail & Info */}
-                  <div className="flex items-center gap-3 min-w-0">
+                  <div className="flex items-center gap-3 min-w-0 flex-1">
                     <div className="relative w-12 h-14 rounded-lg bg-slate-900 border border-slate-800 flex-shrink-0 overflow-hidden flex items-center justify-center">
                       {item.thumbnailUrl ? (
                         <img
                           src={item.thumbnailUrl}
-                          alt="Preview"
+                          alt={`Prévia ${item.name}`}
                           className="w-full h-full object-cover"
                         />
                       ) : (
@@ -192,36 +266,79 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
                       </span>
                     </div>
 
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-[10px] font-bold text-slate-400">#{idx + 1}</span>
-                        <h4 className="text-xs font-bold text-white truncate max-w-[180px] sm:max-w-[260px]">
+                        <h4 className="text-xs font-bold text-white truncate max-w-[180px] sm:max-w-[240px]">
                           {item.name}
                         </h4>
+                        {modifiedSections.length > 0 && (
+                          <span
+                            title={`Personalizado: ${modifiedSections.join(', ')}`}
+                            className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold"
+                          >
+                            {modifiedSections.length}{' '}
+                            {modifiedSections.length === 1 ? 'ajuste individual' : 'ajustes individuais'}
+                          </span>
+                        )}
                       </div>
-                      <div className="text-[10px] text-slate-400 flex items-center gap-2 mt-0.5">
-                        <span>Corte: {item.trim.startTime.toFixed(1)}s - {item.trim.endTime.toFixed(1)}s</span>
-                        {item.width > 0 && <span>({item.width}×{item.height})</span>}
+
+                      <div className="text-[10px] text-slate-400 flex items-center gap-2 mt-0.5 flex-wrap">
+                        <span>
+                          Corte: {item.trim.startTime.toFixed(1)}s - {item.trim.endTime.toFixed(1)}s
+                        </span>
+                        {item.width > 0 && (
+                          <span>
+                            ({item.width}×{item.height})
+                          </span>
+                        )}
+                        <span className="text-cyan-400 font-mono">
+                          → {itemRes} {itemRatio}
+                        </span>
                       </div>
 
                       {/* Progress bar if processing */}
                       {item.status === 'processing' && (
-                        <div className="w-full bg-slate-800 rounded-full h-1.5 mt-1.5 overflow-hidden">
-                          <div
-                            className="bg-blue-500 h-full transition-all duration-200"
-                            style={{ width: `${item.progress}%` }}
-                          />
+                        <div className="mt-1.5 space-y-1">
+                          <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                            <div
+                              className="bg-blue-500 h-full transition-all duration-200"
+                              style={{ width: `${item.progress}%` }}
+                            />
+                          </div>
+                          {item.statusText && (
+                            <p className="text-[10px] text-blue-300 truncate">{item.statusText}</p>
+                          )}
                         </div>
                       )}
                     </div>
                   </div>
 
                   {/* Status & Actions */}
-                  <div className="flex items-center gap-2 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
-                    {item.status === 'idle' && (
-                      <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                        Pronto
-                      </span>
+                  <div
+                    className="flex items-center gap-1.5 flex-shrink-0 flex-wrap"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onEditVideo(item.id)}
+                      aria-label={`Editar vídeo ${idx + 1}: ${item.name}`}
+                      className="px-2.5 py-1 rounded-lg bg-blue-600/25 hover:bg-blue-600/40 text-blue-200 border border-blue-500/40 text-[11px] font-bold flex items-center gap-1 transition"
+                    >
+                      <Edit3 className="w-3 h-3" />
+                      EDITAR VÍDEO
+                    </button>
+
+                    {item.status !== 'processing' && !isProcessing && (
+                      <button
+                        type="button"
+                        onClick={() => onProcessSingle(item.id)}
+                        title="Processar apenas este vídeo"
+                        aria-label={`Processar só o vídeo ${idx + 1}`}
+                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] font-semibold flex items-center gap-1 transition"
+                      >
+                        <Play className="w-3 h-3 text-cyan-400" />
+                      </button>
                     )}
 
                     {item.status === 'processing' && (
@@ -231,18 +348,16 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
                       </span>
                     )}
 
-                    {item.status === 'done' && (
-                      <div className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => onDownloadSingle(item)}
-                          title="Baixar vídeo gerado"
-                          className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold flex items-center gap-1 transition shadow-sm"
-                        >
-                          <Download className="w-3 h-3" />
-                          {item.outputBlob?.type.includes('mp4') ? 'MP4' : 'Baixar HD'}
-                        </button>
-                      </div>
+                    {item.status === 'done' && item.outputBlob && (
+                      <button
+                        type="button"
+                        onClick={() => onDownloadSingle(item)}
+                        title={`Baixar vídeo gerado (.${itemExt})`}
+                        className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold flex items-center gap-1 transition shadow-sm"
+                      >
+                        <Download className="w-3 h-3" />
+                        {itemExt.toUpperCase()}
+                      </button>
                     )}
 
                     {item.status === 'error' && (
@@ -254,16 +369,44 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
                     <button
                       type="button"
                       onClick={() => onRemoveVideo(item.id)}
+                      disabled={isProcessing && item.status === 'processing'}
                       title="Remover vídeo da fila"
-                      className="w-7 h-7 rounded-lg bg-slate-800/80 hover:bg-red-500/20 hover:text-red-400 text-slate-400 flex items-center justify-center transition"
+                      aria-label={`Remover vídeo ${idx + 1} da fila`}
+                      className="w-7 h-7 rounded-lg bg-slate-800/80 hover:bg-red-500/20 hover:text-red-400 disabled:opacity-40 text-slate-400 flex items-center justify-center transition"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 </div>
 
-                {/* Individual Title input line for this specific video */}
-                <div className="pt-1.5 border-t border-slate-800/60" onClick={(e) => e.stopPropagation()}>
+                {/* Per-Video Error Details + Retry */}
+                {item.status === 'error' && item.errorMessage && (
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    className="p-2.5 rounded-lg bg-red-950/50 border border-red-500/40 text-xs text-red-200 flex items-center justify-between gap-2 flex-wrap"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
+                      <span>{item.errorMessage}</span>
+                    </span>
+                    {!isProcessing && (
+                      <button
+                        type="button"
+                        onClick={() => onProcessSingle(item.id)}
+                        className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-500 text-white text-[11px] font-bold flex items-center gap-1 transition"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        Tentar Novamente
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Individual Title input line */}
+                <div
+                  className="pt-1.5 border-t border-slate-800/60"
+                  onClick={(e) => e.stopPropagation()}
+                >
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] text-slate-400 font-semibold flex items-center gap-1 flex-shrink-0">
                       <Type className="w-3 h-3 text-cyan-400" /> Título:
@@ -288,7 +431,7 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
         >
           <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg p-5 shadow-2xl space-y-4 text-slate-100">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
@@ -306,7 +449,8 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
             </div>
 
             <p className="text-xs text-slate-300">
-              Digite ou cole sua lista de títulos abaixo (1 título por linha). O sistema aplicará a <strong>Linha 1 no Vídeo 1</strong>, a <strong>Linha 2 no Vídeo 2</strong>, e assim por diante.
+              Digite ou cole sua lista de títulos abaixo (1 título por linha). O sistema aplicará a{' '}
+              <strong>Linha 1 no Vídeo 1</strong>, a <strong>Linha 2 no Vídeo 2</strong>, e assim por diante.
             </p>
 
             <textarea
@@ -380,7 +524,9 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
                 className="flex-1 sm:flex-initial px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-cyan-500 hover:from-blue-500 hover:to-cyan-400 text-white text-xs font-extrabold flex items-center justify-center gap-2 transition shadow-lg shadow-blue-500/25 active:scale-95"
               >
                 <Sparkles className="w-4 h-4" />
-                {queue.length === 1 ? 'Gerar Vídeo MP4' : `Aplicar em Todos (${queue.length})`}
+                {queue.length === 1
+                  ? `Gerar Vídeo (${detectedFormatLabel})`
+                  : `Processar Todos (${queue.length})`}
               </button>
             )}
           </div>

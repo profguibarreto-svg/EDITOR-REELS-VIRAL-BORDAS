@@ -1,86 +1,122 @@
-import React, { useEffect, useRef, useState } from 'react';
-import {
-  FrameStyle,
-  ProfileBrand,
-  VisualEffects,
-  VideoCropSettings,
-  ExportSettings,
-  VideoQueueItem,
-} from '../types/video';
-import { calculateSourceCropRect, calculateDestPlacement, formatTime } from '../utils/geometryMath';
-import { getFrameLayoutSlot, renderBackground, renderFrameOverlay } from '../utils/frameRenderer';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { VideoProjectSettings, VideoQueueItem } from '../types/video';
+import { formatTime } from '../utils/geometryMath';
+import { buildFilterString, renderCompositeFrame } from '../utils/frameRenderer';
+import { getSupportedMimeType } from '../utils/videoProcessor';
 import {
   Play,
   Pause,
-  Maximize2,
   Download,
   RotateCcw,
   Sparkles,
   Smartphone,
-  Sliders,
+  Film,
 } from 'lucide-react';
 
 interface LiveCanvasPreviewProps {
   activeItem: VideoQueueItem | null;
-  frameStyle: FrameStyle;
-  brand: ProfileBrand;
-  effects: VisualEffects;
-  cropSettings: VideoCropSettings;
-  exportSettings: ExportSettings;
+  activeIndex?: number;
+  resolvedSettings: VideoProjectSettings;
+  seekSignal?: { id: string; time: number; seq: number } | null;
   onDownloadActive?: () => void;
+  isProcessing?: boolean;
+  editingContextLabel?: string;
 }
 
 export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
   activeItem,
-  frameStyle,
-  brand,
-  effects,
-  cropSettings,
-  exportSettings,
+  activeIndex = 0,
+  resolvedSettings,
+  seekSignal,
   onDownloadActive,
+  isProcessing = false,
+  editingContextLabel,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const timeDisplayRef = useRef<HTMLElement>(null);
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
+  const [assetTick, setAssetTick] = useState<number>(0);
 
-  // Hidden image elements for avatar and custom frame
   const avatarImgRef = useRef<HTMLImageElement | null>(null);
   const customFrameImgRef = useRef<HTMLImageElement | null>(null);
 
-  // Extract stable primitives from activeItem to avoid effect re-runs when progress/status updates
+  const { frameEnabled, frameStyle, brand, crop, effects, exportSettings } = resolvedSettings;
+
   const activeItemId = activeItem?.id;
   const activeItemUrl = activeItem?.url;
   const trimStart = activeItem?.trim.startTime || 0;
   const trimEnd = activeItem?.trim.endTime || (activeItem?.duration ?? 10);
   const customHeadline = activeItem?.customHeadline;
 
+  // Load avatar image cleanly
   useEffect(() => {
+    let cancelled = false;
     if (brand.avatarUrl) {
       const img = new Image();
       img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (!cancelled) {
+          avatarImgRef.current = img;
+          setAssetTick((t) => t + 1);
+        }
+      };
+      img.onerror = () => {
+        if (!cancelled) avatarImgRef.current = null;
+      };
       img.src = brand.avatarUrl;
       avatarImgRef.current = img;
     } else {
       avatarImgRef.current = null;
+      setAssetTick((t) => t + 1);
     }
+    return () => {
+      cancelled = true;
+    };
   }, [brand.avatarUrl]);
 
+  // Load custom PNG overlay cleanly
   useEffect(() => {
+    let cancelled = false;
     if (brand.customFrameUrl && frameStyle === 'custom') {
       const img = new Image();
       img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (!cancelled) {
+          customFrameImgRef.current = img;
+          setAssetTick((t) => t + 1);
+        }
+      };
+      img.onerror = () => {
+        if (!cancelled) customFrameImgRef.current = null;
+      };
       img.src = brand.customFrameUrl;
       customFrameImgRef.current = img;
     } else {
       customFrameImgRef.current = null;
+      setAssetTick((t) => t + 1);
     }
+    return () => {
+      cancelled = true;
+    };
   }, [brand.customFrameUrl, frameStyle]);
 
-  // Handle video element setup only when video source changes
+  // Setup video element when active video changes + clean disposal
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !activeItemUrl) return;
+    if (!video) return;
+
+    if (!activeItemUrl || activeItem?.status === 'error') {
+      try {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+      } catch {
+        // ignore
+      }
+      setIsPlaying(false);
+      return;
+    }
 
     video.src = activeItemUrl;
     video.currentTime = trimStart;
@@ -92,148 +128,134 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
         .then(() => setIsPlaying(true))
         .catch(() => setIsPlaying(false));
     }
-  }, [activeItemId, activeItemUrl]);
 
-  // Adjust playback rate when speed setting changes without reloading video
+    return () => {
+      try {
+        video.pause();
+      } catch {
+        // ignore
+      }
+    };
+  }, [activeItemId, activeItemUrl, activeItem?.status]);
+
+  // Apply seek signal from trim sliders immediately
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !seekSignal || seekSignal.id !== activeItemId || !activeItemUrl) return;
+    try {
+      video.currentTime = seekSignal.time;
+      if (timeDisplayRef.current) {
+        timeDisplayRef.current.textContent = formatTime(seekSignal.time);
+      }
+    } catch {
+      // ignore invalid seek range
+    }
+  }, [seekSignal, activeItemId, activeItemUrl]);
+
+  // Adjust playback rate without reloading
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.playbackRate = exportSettings.speed || 1.0;
     }
   }, [exportSettings.speed]);
 
-  // Main rendering loop - zero setState calls inside requestAnimationFrame
-  useEffect(() => {
-    let animId: number;
+  const drawSingleFrame = useCallback(() => {
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-    const render = () => {
-      const canvas = canvasRef.current;
-      const video = videoRef.current;
-      if (!canvas) return;
+    const w = canvas.width;
+    const h = canvas.height;
 
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
+    if (video && activeItemUrl && activeItem?.status !== 'error') {
+      const start = trimStart;
+      const end = trimEnd > start ? trimEnd : video.duration || 10;
 
-      const w = canvas.width;
-      const h = canvas.height;
-
-      // Handle video loop inside trim bounds and update time DOM ref directly
-      if (video && activeItemUrl) {
-        const start = trimStart;
-        const end = trimEnd > start ? trimEnd : video.duration || 10;
-
-        if (video.currentTime >= end || video.currentTime < start) {
+      if (video.currentTime >= end || video.currentTime < start - 0.05) {
+        try {
           video.currentTime = start;
-        }
-        if (timeDisplayRef.current) {
-          timeDisplayRef.current.textContent = formatTime(video.currentTime);
-        }
-      }
-
-      // 1. Render Background
-      renderBackground(
-        ctx,
-        w,
-        h,
-        video,
-        effects,
-        cropSettings.fitMode,
-        cropSettings.backdropColor
-      );
-
-      // 2. Render Video
-      if (video && video.readyState >= 2) {
-        const slot = getFrameLayoutSlot(frameStyle);
-        const srcRect = calculateSourceCropRect(video.videoWidth, video.videoHeight, cropSettings);
-        const croppedAspect = srcRect.sw / srcRect.sh;
-        const destRect = calculateDestPlacement(
-          w,
-          h,
-          croppedAspect,
-          slot,
-          cropSettings.scale,
-          cropSettings.positionX,
-          cropSettings.positionY
-        );
-
-        ctx.save();
-        let filterStr = `brightness(${effects.brightness}) contrast(${effects.contrast}) saturate(${effects.saturation})`;
-        if (effects.sharpen) {
-          filterStr += ' contrast(1.15)';
-        }
-        ctx.filter = filterStr;
-
-        ctx.drawImage(
-          video,
-          srcRect.sx,
-          srcRect.sy,
-          srcRect.sw,
-          srcRect.sh,
-          destRect.dx,
-          destRect.dy,
-          destRect.dw,
-          destRect.dh
-        );
-        ctx.restore();
-
-        // Optional vignette
-        if (effects.vignette) {
-          ctx.save();
-          const vigGrad = ctx.createRadialGradient(
-            w / 2,
-            h / 2,
-            w * 0.35,
-            w / 2,
-            h / 2,
-            w * 0.75
-          );
-          vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
-          vigGrad.addColorStop(1, 'rgba(0,0,0,0.55)');
-          ctx.fillStyle = vigGrad;
-          ctx.fillRect(0, 0, w, h);
-          ctx.restore();
+        } catch {
+          // ignore
         }
       }
+      if (timeDisplayRef.current) {
+        timeDisplayRef.current.textContent = formatTime(video.currentTime);
+      }
+    }
 
-      // 3. Render Frame Overlay
-      renderFrameOverlay(
-        ctx,
-        w,
-        h,
-        frameStyle,
-        brand,
-        avatarImgRef.current,
-        customFrameImgRef.current,
-        video ? video.currentTime : 0,
-        customHeadline
-      );
+    const filterStr = buildFilterString(effects);
 
-      animId = requestAnimationFrame(render);
-    };
-
-    render();
-
-    return () => {
-      cancelAnimationFrame(animId);
-    };
+    renderCompositeFrame({
+      ctx,
+      width: w,
+      height: h,
+      videoEl: activeItem && activeItem.status !== 'error' ? video : null,
+      frameEnabled,
+      frameStyle,
+      brand,
+      crop,
+      effects,
+      avatarImg: avatarImgRef.current,
+      customFrameImg: customFrameImgRef.current,
+      currentTime: video ? video.currentTime : 0,
+      customHeadline,
+      filterStr,
+    });
   }, [
-    activeItemId,
+    activeItem,
     activeItemUrl,
     trimStart,
     trimEnd,
-    customHeadline,
+    frameEnabled,
     frameStyle,
     brand,
+    crop,
     effects,
-    cropSettings,
-    exportSettings.aspectRatio,
+    customHeadline,
+    assetTick,
   ]);
+
+  // Main render loop (only schedules RAF while actively playing)
+  useEffect(() => {
+    if (isProcessing) {
+      if (videoRef.current && !videoRef.current.paused) {
+        videoRef.current.pause();
+      }
+      return;
+    }
+
+    let animId: number | null = null;
+    let cancelled = false;
+
+    const renderLoop = () => {
+      if (cancelled) return;
+      drawSingleFrame();
+      const video = videoRef.current;
+      if (isPlaying && video && !video.paused && !video.ended) {
+        animId = requestAnimationFrame(renderLoop);
+      }
+    };
+
+    renderLoop();
+
+    return () => {
+      cancelled = true;
+      if (animId !== null) {
+        cancelAnimationFrame(animId);
+      }
+    };
+  }, [isProcessing, isPlaying, drawSingleFrame, exportSettings.aspectRatio]);
 
   const togglePlay = () => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !activeItemUrl) return;
     if (video.paused) {
-      video.play();
-      setIsPlaying(true);
+      video
+        .play()
+        .then(() => setIsPlaying(true))
+        .catch(() => setIsPlaying(false));
     } else {
       video.pause();
       setIsPlaying(false);
@@ -242,36 +264,75 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
 
   const restartClip = () => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !activeItemUrl) return;
     video.currentTime = trimStart;
     if (timeDisplayRef.current) {
       timeDisplayRef.current.textContent = formatTime(video.currentTime);
     }
-    video.play();
-    setIsPlaying(true);
+    video
+      .play()
+      .then(() => setIsPlaying(true))
+      .catch(() => setIsPlaying(false));
   };
 
   const aspectClass =
     exportSettings.aspectRatio === '9:16'
-      ? 'aspect-[9/16] max-h-[580px]'
+      ? 'aspect-[9/16] max-h-[560px]'
       : exportSettings.aspectRatio === '1:1'
-      ? 'aspect-square max-h-[520px]'
-      : 'aspect-video max-h-[380px]';
+      ? 'aspect-square max-h-[500px]'
+      : 'aspect-video max-h-[360px]';
+
+  const canvasW = 720;
+  const canvasH =
+    exportSettings.aspectRatio === '9:16'
+      ? 1280
+      : exportSettings.aspectRatio === '1:1'
+      ? 720
+      : 405;
+
+  const detectedFormat = getSupportedMimeType();
+  const outputLabel =
+    activeItem?.outputExtension === 'mp4' || activeItem?.outputBlob?.type.includes('mp4')
+      ? 'Baixar MP4 HD'
+      : 'Baixar WebM HD';
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-lg flex flex-col items-center">
       {/* Top Header */}
-      <div className="w-full flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
-        <div className="flex items-center gap-2">
-          <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-          <h3 className="text-sm font-bold text-white">Prévia em Tempo Real (60 FPS)</h3>
+      <div className="w-full flex items-center justify-between pb-3 border-b border-slate-800 mb-3 gap-2 flex-wrap">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse flex-shrink-0" />
+          <h3 className="text-sm font-bold text-white truncate">
+            Prévia em Tempo Real
+          </h3>
         </div>
-        <div className="flex items-center gap-2 text-xs">
+        <div className="flex items-center gap-1.5 text-[11px] flex-wrap">
+          {editingContextLabel && (
+            <span className="px-2 py-0.5 rounded bg-blue-500/15 text-blue-300 font-semibold border border-blue-500/30">
+              {editingContextLabel}
+            </span>
+          )}
           <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono font-semibold border border-slate-700">
-            {exportSettings.resolution} · {exportSettings.aspectRatio}
+            {exportSettings.resolution} · {exportSettings.aspectRatio} · {exportSettings.fps}fps
           </span>
         </div>
       </div>
+
+      {/* Currently Previewing Banner */}
+      {activeItem && (
+        <div className="w-full mb-3 px-3 py-1.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between gap-2 text-[11px]">
+          <span className="text-slate-300 flex items-center gap-1.5 min-w-0">
+            <Film className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
+            <span className="text-slate-400">Visualizando:</span>
+            <strong className="text-white truncate">
+              #{activeIndex + 1} {activeItem.name}
+            </strong>
+          </span>
+          <span className="text-slate-400 font-mono flex-shrink-0">
+            Saída: .{detectedFormat.extension.toUpperCase()}
+          </span>
+        </div>
+      )}
 
       {/* Hidden Native Video for Canvas playback */}
       <video
@@ -280,41 +341,75 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
         muted
         loop
         crossOrigin="anonymous"
+        onLoadedData={drawSingleFrame}
+        onCanPlay={drawSingleFrame}
+        onSeeked={drawSingleFrame}
         className="hidden"
       />
 
-      {/* Canvas Display Container (Phone Mockup Styling) */}
+      {/* Canvas Display Container */}
       <div className="relative group w-full flex items-center justify-center p-2 bg-slate-950/80 rounded-2xl border border-slate-800/80 shadow-2xl overflow-hidden">
-        <div className={`relative ${aspectClass} w-auto shadow-2xl rounded-xl overflow-hidden border border-slate-800 bg-black`}>
+        <div
+          className={`relative ${aspectClass} w-auto shadow-2xl rounded-xl overflow-hidden border border-slate-800 bg-black`}
+        >
           <canvas
             ref={canvasRef}
-            width={720}
-            height={exportSettings.aspectRatio === '9:16' ? 1280 : exportSettings.aspectRatio === '1:1' ? 720 : 405}
+            width={canvasW}
+            height={canvasH}
             className="w-full h-full object-contain cursor-pointer"
             onClick={togglePlay}
           />
 
           {/* Quick Play/Pause Center Overlay on Hover */}
-          <button
-            type="button"
-            onClick={togglePlay}
-            aria-label={isPlaying ? 'Pausar prévia' : 'Reproduzir prévia'}
-            className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity"
-          >
-            <div className="w-12 h-12 rounded-full bg-slate-900/90 border border-slate-600 text-white flex items-center justify-center shadow-lg">
-              {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
+          {!isProcessing && activeItem && activeItem.status !== 'error' && (
+            <button
+              type="button"
+              onClick={togglePlay}
+              aria-label={isPlaying ? 'Pausar prévia' : 'Reproduzir prévia'}
+              className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity"
+            >
+              <div className="w-12 h-12 rounded-full bg-slate-900/90 border border-slate-600 text-white flex items-center justify-center shadow-lg">
+                {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
+              </div>
+            </button>
+          )}
+
+          {/* Processing Overlay */}
+          {isProcessing && (
+            <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-sm flex flex-col items-center justify-center p-5 text-center z-20">
+              <div className="w-11 h-11 rounded-xl bg-blue-600/20 border border-blue-500/40 text-blue-400 flex items-center justify-center mb-3">
+                <Sparkles className="w-5 h-5 animate-spin" style={{ animationDuration: '3s' }} />
+              </div>
+              <span className="text-xs font-bold text-white mb-1">
+                Renderizando {exportSettings.resolution} ({detectedFormat.label})
+              </span>
+              <span className="text-[11px] text-slate-400 max-w-[210px] leading-relaxed">
+                Prévia pausada para dedicar máxima performance ao exportador sem travamentos.
+              </span>
             </div>
-          </button>
+          )}
+
+          {/* Empty State */}
+          {!activeItem && !isProcessing && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/80 pointer-events-none z-10">
+              <Smartphone className="w-10 h-10 text-slate-600 mb-2 stroke-1" />
+              <span className="text-xs font-semibold text-slate-300">Nenhum vídeo selecionado</span>
+              <span className="text-[10px] text-slate-500 mt-1 max-w-[210px] leading-relaxed">
+                Adicione vídeos na aba "Fila em Lote" ou carregue um exemplo para ver a prévia ao vivo.
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Video Transport Controls */}
       {activeItem && (
-        <div className="w-full mt-4 flex items-center justify-between gap-3 text-xs bg-slate-950/60 p-2.5 rounded-xl border border-slate-800">
+        <div className="w-full mt-4 flex items-center justify-between gap-3 text-xs bg-slate-950/60 p-2.5 rounded-xl border border-slate-800 flex-wrap">
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={togglePlay}
+              aria-label={isPlaying ? 'Pausar prévia' : 'Reproduzir prévia'}
               className="w-8 h-8 rounded-lg bg-blue-600 hover:bg-blue-500 text-white flex items-center justify-center transition"
             >
               {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
@@ -322,6 +417,7 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
             <button
               type="button"
               onClick={restartClip}
+              aria-label="Reiniciar prévia do início"
               title="Reiniciar prévia do início"
               className="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center transition"
             >
@@ -335,14 +431,14 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
             </span>
           </div>
 
-          {activeItem.status === 'done' && (
+          {activeItem.status === 'done' && activeItem.outputBlob && (
             <button
               type="button"
               onClick={onDownloadActive}
               className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold flex items-center gap-1.5 transition shadow-sm"
             >
               <Download className="w-3.5 h-3.5" />
-              {activeItem.outputBlob?.type.includes('mp4') ? 'Baixar MP4' : 'Baixar Vídeo HD'}
+              {outputLabel}
             </button>
           )}
         </div>

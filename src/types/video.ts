@@ -24,7 +24,7 @@ export interface ProfileBrand {
   fontSizeHeadline: number; // multiplier 0.6 to 1.8 (default 1.0)
   fontSizeName: number; // multiplier 0.6 to 1.8 (default 1.0)
   avatarScale: number; // multiplier 0.6 to 1.8 (default 1.0)
-  framePositionY: number; // percentage 0 to 100 (default 10)
+  framePositionY: number; // percentage 0 to 100 (default 2.5)
   framePositionX: number; // percentage 0 to 100 (default 50)
   frameScale: number; // multiplier 0.7 to 1.3 (default 1.0)
   textAlign: 'left' | 'center' | 'right';
@@ -70,6 +70,16 @@ export interface ExportSettings {
   speed: number;
 }
 
+export interface VideoProjectSettings {
+  frameEnabled: boolean;
+  frameStyle: FrameStyle;
+  brand: ProfileBrand;
+  crop: VideoCropSettings;
+  effects: VisualEffects;
+  audio: AudioSettings;
+  exportSettings: ExportSettings;
+}
+
 export interface VideoQueueItem {
   id: string;
   file: File;
@@ -83,12 +93,19 @@ export interface VideoQueueItem {
     startTime: number;
     endTime: number;
   };
-  crop?: Partial<VideoCropSettings>;
+  /** Independent per-video project configuration (Level 2) */
+  settings: VideoProjectSettings;
+  /** Quick per-video headline override (synced with settings.brand.headline) */
   customHeadline?: string;
+  /** Legacy compatibility alias if needed */
+  crop?: Partial<VideoCropSettings>;
   status: 'idle' | 'processing' | 'done' | 'error';
   progress: number;
+  statusText?: string;
   outputBlob: Blob | null;
   outputUrl: string | null;
+  outputMimeType?: string;
+  outputExtension?: 'mp4' | 'webm';
   errorMessage: string | null;
   outputSizeMb?: number;
 }
