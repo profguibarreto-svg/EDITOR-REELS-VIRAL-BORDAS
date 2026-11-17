@@ -9,18 +9,27 @@ const GITHUB_PAGES_BASE = '/EDITOR-REELS-VIRAL-BORDAS/';
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 
 function devRootRedirectPlugin(): Plugin {
+  const redirectMiddleware = (
+    req: { url?: string },
+    res: { statusCode: number; setHeader: (k: string, v: string) => void; end: () => void },
+    next: () => void
+  ) => {
+    if (req.url === '/' || req.url === '') {
+      res.statusCode = 302;
+      res.setHeader('Location', GITHUB_PAGES_BASE);
+      res.end();
+      return;
+    }
+    next();
+  };
+
   return {
     name: 'dev-root-redirect',
     configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        if (req.url === '/' || req.url === '') {
-          res.statusCode = 302;
-          res.setHeader('Location', GITHUB_PAGES_BASE);
-          res.end();
-          return;
-        }
-        next();
-      });
+      server.middlewares.use(redirectMiddleware);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(redirectMiddleware);
     },
   };
 }
