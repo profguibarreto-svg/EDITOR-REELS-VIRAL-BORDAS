@@ -219,11 +219,16 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
 
   // Main render loop (only schedules RAF while actively playing)
   useEffect(() => {
+    const videoEl = videoRef.current;
     if (isProcessing) {
-      if (videoRef.current && !videoRef.current.paused) {
-        videoRef.current.pause();
+      if (videoEl && !videoEl.paused) {
+        videoEl.pause();
       }
       return;
+    }
+
+    if (isPlaying && videoEl && activeItemUrl && activeItem?.status !== 'error' && videoEl.paused) {
+      videoEl.play().catch(() => setIsPlaying(false));
     }
 
     let animId: number | null = null;
@@ -246,7 +251,7 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
         cancelAnimationFrame(animId);
       }
     };
-  }, [isProcessing, isPlaying, drawSingleFrame, exportSettings.aspectRatio]);
+  }, [isProcessing, isPlaying, activeItemUrl, activeItem?.status, drawSingleFrame, exportSettings.aspectRatio]);
 
   const togglePlay = () => {
     const video = videoRef.current;

@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { ExportSettings } from '../types/video';
 import { downloadLinuxPackage, downloadSourceCodeTxt } from '../utils/exportZip';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface HeaderProps {
   exportSettings: ExportSettings;
@@ -139,6 +140,9 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           </div>
 
+          {/* PWA Install Button (Windows / Android / iOS) */}
+          <PWAInstallButton />
+
           {/* Documentation Button */}
           <button
             type="button"
@@ -169,7 +173,8 @@ export const Header: React.FC<HeaderProps> = ({
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold transition shadow-md shadow-emerald-900/30 border border-emerald-400/30 active:scale-95 cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
-            <span>Baixar para Linux</span>
+            <span className="hidden sm:inline">Baixar para Linux</span>
+            <span className="sm:hidden">Linux</span>
           </button>
         </div>
       </div>

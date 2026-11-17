@@ -248,9 +248,9 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
                     : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
                 }`}
               >
-                <div className="flex items-start justify-between gap-3 flex-wrap sm:flex-nowrap">
+                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
                   {/* Thumbnail & Info */}
-                  <div className="flex items-center gap-3 min-w-0 flex-1">
+                  <div className="flex items-center gap-3 min-w-0 w-full sm:w-auto sm:flex-1">
                     <div className="relative w-12 h-14 rounded-lg bg-slate-900 border border-slate-800 flex-shrink-0 overflow-hidden flex items-center justify-center">
                       {item.thumbnailUrl ? (
                         <img

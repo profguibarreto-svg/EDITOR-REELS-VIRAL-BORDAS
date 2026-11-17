@@ -45,8 +45,15 @@ export function getSupportedMimeType(withAudio = true): DetectedExportFormat {
     ? [
         'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
         'video/mp4;codecs=avc1.4d401f,mp4a.40.2',
+        'video/mp4;codecs=h264,aac',
+        'video/mp4;codecs=avc1',
       ]
-    : ['video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1.4d401f'];
+    : [
+        'video/mp4;codecs=avc1.42E01E',
+        'video/mp4;codecs=avc1.4d401f',
+        'video/mp4;codecs=h264',
+        'video/mp4;codecs=avc1',
+      ];
 
   const browserSupportsMp4 = mp4Candidates.some((m) => {
     try {
@@ -378,6 +385,8 @@ export async function processVideoItem(
   let animFrameId: number | null = null;
   let backgroundIntervalId: ReturnType<typeof setInterval> | null = null;
   let hardTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  let pendingStopTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  let warmupIntervalId: ReturnType<typeof setInterval> | null = null;
   let audioCtx: AudioContext | null = null;
   let mediaRecorder: MediaRecorder | null = null;
   let canvas: HTMLCanvasElement | null = null;
@@ -404,6 +413,14 @@ export async function processVideoItem(
     if (hardTimeoutId !== null) {
       clearTimeout(hardTimeoutId);
       hardTimeoutId = null;
+    }
+    if (pendingStopTimeoutId !== null) {
+      clearTimeout(pendingStopTimeoutId);
+      pendingStopTimeoutId = null;
+    }
+    if (warmupIntervalId !== null) {
+      clearInterval(warmupIntervalId);
+      warmupIntervalId = null;
     }
     if (abortListener && signal) {
       signal.removeEventListener('abort', abortListener);
@@ -712,6 +729,9 @@ export async function processVideoItem(
 
     const bps = (exportSettings.bitrateMbps || 8) * 1_000_000;
     const chunks: Blob[] = [];
+    let totalBytesRecorded = 0;
+    let recorderActuallyStarted = false;
+    let resolveRecorderStarted: (() => void) | null = null;
 
     try {
       mediaRecorder = new MediaRecorder(canvasStream, {
@@ -728,21 +748,36 @@ export async function processVideoItem(
     const actualExt: 'mp4' | 'webm' = actualMime.includes('mp4') ? 'mp4' : 'webm';
     const actualLabel = actualExt === 'mp4' ? 'MP4 HD' : 'WebM HD';
 
+    const recorderStartedPromise = new Promise<void>((resolveStart) => {
+      resolveRecorderStarted = resolveStart;
+    });
+
     const recorderFinishedPromise = new Promise<ProcessedVideoResult>((resolveRec, rejectRec) => {
       if (!mediaRecorder) return rejectRec(new Error('MediaRecorder não inicializado'));
+
+      mediaRecorder.onstart = () => {
+        recorderActuallyStarted = true;
+        resolveRecorderStarted?.();
+        resolveRecorderStarted = null;
+      };
 
       mediaRecorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
           chunks.push(e.data);
+          totalBytesRecorded += e.data.size;
         }
       };
 
       mediaRecorder.onerror = (e) => {
+        resolveRecorderStarted?.();
+        resolveRecorderStarted = null;
         const msg = (e as unknown as { error?: { message?: string } })?.error?.message;
         rejectRec(new Error(`Erro durante a gravação (${actualLabel}): ${msg || 'falha de codificação'}`));
       };
 
       mediaRecorder.onstop = async () => {
+        resolveRecorderStarted?.();
+        resolveRecorderStarted = null;
         try {
           if (signal?.aborted) {
             return rejectRec(new Error('Processamento cancelado pelo usuário'));
@@ -782,6 +817,8 @@ export async function processVideoItem(
       };
 
       abortListener = () => {
+        resolveRecorderStarted?.();
+        resolveRecorderStarted = null;
         rejectRec(new Error('Processamento cancelado pelo usuário'));
       };
       if (signal) {
@@ -825,31 +862,62 @@ export async function processVideoItem(
 
     const filterStr = buildFilterString(effects);
 
-    renderCompositeFrame({
-      ctx,
-      width: targetW,
-      height: targetH,
-      videoEl,
-      frameEnabled,
-      frameStyle,
-      brand,
-      crop,
-      effects,
-      avatarImg,
-      customFrameImg,
-      currentTime: 0,
-      customHeadline: item.customHeadline,
-      filterStr,
-    });
-    capturedVideoTrack?.requestFrame?.();
+    const drawInitialFrame = () => {
+      if (!ctx || !videoEl) return;
+      renderCompositeFrame({
+        ctx,
+        width: targetW,
+        height: targetH,
+        videoEl,
+        frameEnabled,
+        frameStyle,
+        brand,
+        crop,
+        effects,
+        avatarImg,
+        customFrameImg,
+        currentTime: 0,
+        customHeadline: item.customHeadline,
+        filterStr,
+      });
+      capturedVideoTrack?.requestFrame?.();
+    };
 
-    // Start recording with 250ms timeslice
-    mediaRecorder.start(250);
+    // Paint initial frame and start MediaRecorder, pumping keepalive frames until encoder fires onstart
+    drawInitialFrame();
+    mediaRecorder.start(200);
+
+    warmupIntervalId = setInterval(() => {
+      if (cleanupRun || signal?.aborted || recorderActuallyStarted) {
+        if (warmupIntervalId !== null) {
+          clearInterval(warmupIntervalId);
+          warmupIntervalId = null;
+        }
+        return;
+      }
+      drawInitialFrame();
+    }, 60);
+
+    await Promise.race([
+      recorderStartedPromise,
+      new Promise<void>((r) => setTimeout(r, 4500)),
+    ]);
+    if (warmupIntervalId !== null) {
+      clearInterval(warmupIntervalId);
+      warmupIntervalId = null;
+    }
+
+    if (signal?.aborted) {
+      throw new Error('Processamento cancelado pelo usuário');
+    }
+
+    const recordingStartedAt = performance.now();
 
     if (bgmSource) {
       bgmSource.start(0);
     }
 
+    // Now start playing the video clip cleanly from startTime while MediaRecorder is actively capturing
     try {
       videoEl.muted = !wantsOriginalAudio;
       await videoEl.play();
@@ -872,7 +940,7 @@ export async function processVideoItem(
       }
     };
 
-    const stopRecorderSafely = () => {
+    const stopRecorderSafely = (graceful = true) => {
       if (hardTimeoutId !== null) {
         clearTimeout(hardTimeoutId);
         hardTimeoutId = null;
@@ -885,7 +953,33 @@ export async function processVideoItem(
         clearInterval(backgroundIntervalId);
         backgroundIntervalId = null;
       }
-      if (mediaRecorder && mediaRecorder.state === 'recording') {
+      if (pendingStopTimeoutId !== null) {
+        clearTimeout(pendingStopTimeoutId);
+        pendingStopTimeoutId = null;
+      }
+
+      if (!mediaRecorder || mediaRecorder.state !== 'recording') {
+        return;
+      }
+
+      if (graceful) {
+        capturedVideoTrack?.requestFrame?.();
+        try {
+          mediaRecorder.requestData();
+        } catch {
+          // requestData not supported in all states on every mobile browser
+        }
+        pendingStopTimeoutId = setTimeout(() => {
+          pendingStopTimeoutId = null;
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            try {
+              mediaRecorder.stop();
+            } catch {
+              // ignore
+            }
+          }
+        }, 120);
+      } else {
         try {
           mediaRecorder.stop();
         } catch {
@@ -898,12 +992,14 @@ export async function processVideoItem(
     const maxProcessingMs = Math.max(30000, effectiveOutputDuration * 4 * 1000);
     hardTimeoutId = setTimeout(() => {
       console.warn('Watchdog: Finalizando gravação por tempo limite de segurança.');
-      stopRecorderSafely();
+      stopRecorderSafely(false);
     }, maxProcessingMs);
 
     let isDrawing = false;
     let hasStopped = false;
     let drawnFrames = 1;
+    const minWallRecordMs = Math.max(350, Math.min(700, Math.round(effectiveOutputDuration * 500)));
+
     const drawFrame = () => {
       if (cleanupRun || hasStopped || signal?.aborted || isDrawing || !videoEl || !ctx) {
         return;
@@ -913,23 +1009,12 @@ export async function processVideoItem(
       try {
         const curr = videoEl.currentTime;
         const elapsed = Math.max(0, curr - startTime);
+        const wallElapsedMs = performance.now() - recordingStartedAt;
         const pct = Math.min(94, 30 + Math.round((elapsed / clipDuration) * 64));
         sendThrottledProgress(
           pct,
           `Renderizando ${exportSettings.resolution}: ${elapsed.toFixed(1)}s / ${clipDuration.toFixed(1)}s (${pct}%)`
         );
-
-        const isCompleted =
-          drawnFrames >= 4 &&
-          (curr >= endTime - 0.04 ||
-            videoEl.ended ||
-            elapsed >= clipDuration - 0.04);
-
-        if (isCompleted) {
-          hasStopped = true;
-          stopRecorderSafely();
-          return;
-        }
 
         renderCompositeFrame({
           ctx,
@@ -949,6 +1034,22 @@ export async function processVideoItem(
         });
         drawnFrames += 1;
         capturedVideoTrack?.requestFrame?.();
+
+        const reachedVideoEnd =
+          curr >= endTime - 0.04 ||
+          videoEl.ended ||
+          elapsed >= clipDuration - 0.04;
+        const encoderReadyToStop =
+          (recorderActuallyStarted && totalBytesRecorded > 0) ||
+          wallElapsedMs >= Math.max(1200, effectiveOutputDuration * 1000 + 400);
+        const enoughFramesOrTime =
+          (drawnFrames >= 8 && wallElapsedMs >= minWallRecordMs && encoderReadyToStop) ||
+          wallElapsedMs >= effectiveOutputDuration * 1000 + 1800;
+
+        if (reachedVideoEnd && enoughFramesOrTime) {
+          hasStopped = true;
+          stopRecorderSafely(true);
+        }
       } finally {
         isDrawing = false;
       }
@@ -979,7 +1080,7 @@ export async function processVideoItem(
         return;
       }
       const now = performance.now();
-      if (now - lastRenderTimestamp >= Math.max(45, targetIntervalMs * 1.4)) {
+      if (now - lastRenderTimestamp >= Math.max(40, targetIntervalMs * 1.3)) {
         lastRenderTimestamp = now;
         drawFrame();
       }

@@ -12,6 +12,7 @@ import { LiveCanvasPreview } from './components/LiveCanvasPreview';
 import { DocumentationModal } from './components/DocumentationModal';
 import { IndividualVideoEditor } from './components/IndividualVideoEditor';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import {
   getSupportedMimeType,
   probeVideoMetadata,
@@ -642,7 +643,7 @@ export default function App() {
     : 'Padrão Global';
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-blue-500 selection:text-white">
+    <div className="min-h-screen overflow-x-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-blue-500 selection:text-white">
       {/* App Header */}
       <Header
         exportSettings={
@@ -1010,6 +1011,9 @@ export default function App() {
 
       {/* Technical Documentation Modal */}
       <DocumentationModal isOpen={isDocsOpen} onClose={() => setIsDocsOpen(false)} />
+
+      {/* Non-intrusive offline indicator */}
+      <OfflineIndicator />
     </div>
   );
 }

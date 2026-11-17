@@ -146,12 +146,30 @@ export async function createSyntheticDemoVideo(
     });
     const actualMime = recorder.mimeType || selectedMime;
 
+    let totalDemoBytes = 0;
+    let demoStarted = false;
+    let resolveDemoStart: (() => void) | null = null;
+    const demoStartedPromise = new Promise<void>((res) => {
+      resolveDemoStart = res;
+    });
+
+    recorder.onstart = () => {
+      demoStarted = true;
+      resolveDemoStart?.();
+      resolveDemoStart = null;
+    };
+
     recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
+      if (e.data && e.data.size > 0) {
+        chunks.push(e.data);
+        totalDemoBytes += e.data.size;
+      }
     };
 
     const recordingPromise = new Promise<Blob>((resolve, reject) => {
       watchdogId = setTimeout(() => {
+        resolveDemoStart?.();
+        resolveDemoStart = null;
         if (recorder.state === 'recording') {
           try {
             recorder.stop();
@@ -161,14 +179,18 @@ export async function createSyntheticDemoVideo(
         } else {
           reject(new Error('Tempo limite ao gerar vídeo de exemplo.'));
         }
-      }, 8000);
+      }, 10000);
 
       recorder.onerror = () => {
+        resolveDemoStart?.();
+        resolveDemoStart = null;
         if (watchdogId !== null) clearTimeout(watchdogId);
         reject(new Error('Erro no MediaRecorder ao criar vídeo de exemplo.'));
       };
 
       recorder.onstop = () => {
+        resolveDemoStart?.();
+        resolveDemoStart = null;
         if (watchdogId !== null) clearTimeout(watchdogId);
         resolve(new Blob(chunks, { type: actualMime }));
       };
@@ -233,6 +255,18 @@ export async function createSyntheticDemoVideo(
     demoVideoTrack?.requestFrame?.();
     recorder.start(150);
 
+    const warmupTimer = setInterval(() => {
+      if (demoStarted) {
+        clearInterval(warmupTimer);
+        return;
+      }
+      drawSyntheticFrame(0);
+      demoVideoTrack?.requestFrame?.();
+    }, 60);
+
+    await Promise.race([demoStartedPromise, new Promise<void>((r) => setTimeout(r, 4000))]);
+    clearInterval(warmupTimer);
+
     const startedAt = performance.now();
     let stopped = false;
     let drawnFrames = 1;
@@ -241,7 +275,11 @@ export async function createSyntheticDemoVideo(
     const tick = () => {
       if (stopped) return;
       const elapsedSec = (performance.now() - startedAt) / 1000;
-      if (elapsedSec >= durationSec && drawnFrames >= minFramesRequired) {
+      if (
+        elapsedSec >= durationSec &&
+        drawnFrames >= minFramesRequired &&
+        (totalDemoBytes > 0 || elapsedSec >= durationSec + 1.0)
+      ) {
         stopped = true;
         if (rafId !== null) {
           cancelAnimationFrame(rafId);
@@ -253,8 +291,15 @@ export async function createSyntheticDemoVideo(
         }
         if (recorder.state === 'recording') {
           try {
-            recorder.stop();
+            recorder.requestData();
           } catch {}
+          setTimeout(() => {
+            if (recorder.state === 'recording') {
+              try {
+                recorder.stop();
+              } catch {}
+            }
+          }, 80);
         }
         return;
       }

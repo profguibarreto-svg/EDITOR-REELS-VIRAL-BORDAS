@@ -62,7 +62,7 @@ export function downloadSingleVideo(item: VideoQueueItem): void {
 export async function downloadLinuxPackage(): Promise<void> {
   const fileName = 'wifive-pro-studio-linux.zip';
   try {
-    const res = await fetch(`/${fileName}`);
+    const res = await fetch(`${import.meta.env.BASE_URL}${fileName}`);
     const ct = res.headers.get('content-type') || '';
     if (res.ok && !ct.includes('text/html')) {
       const blob = await res.blob();
@@ -107,7 +107,7 @@ function triggerBase64Download(base64: string, fileName: string, mimeType: strin
 export async function downloadSourceCodeZip(): Promise<void> {
   const fileName = 'wifive-pro-studio-codigo-fonte.zip';
   try {
-    const res = await fetch(`/${fileName}`);
+    const res = await fetch(`${import.meta.env.BASE_URL}${fileName}`);
     const ct = res.headers.get('content-type') || '';
     if (res.ok && !ct.includes('text/html')) {
       const blob = await res.blob();
@@ -134,7 +134,7 @@ export async function downloadSourceCodeZip(): Promise<void> {
 export async function downloadSourceCodeTxt(): Promise<void> {
   const fileName = 'CODIGO_FONTE_GERAL.txt';
   try {
-    const res = await fetch(`/${fileName}`);
+    const res = await fetch(`${import.meta.env.BASE_URL}${fileName}`);
     const ct = res.headers.get('content-type') || '';
     if (res.ok && !ct.includes('text/html')) {
       const blob = await res.blob();
