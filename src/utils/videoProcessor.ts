@@ -5,6 +5,7 @@ import {
 } from '../types/video';
 import {
   buildFilterString,
+  buildCachedFrameOverlayCanvas,
   renderCompositeFrame,
 } from './frameRenderer';
 import { generateSyntheticTrackBuffer } from './audioTracks';
@@ -349,6 +350,24 @@ function loadOptionalImage(src: string | null): Promise<HTMLImageElement | null>
   });
 }
 
+function hasNativeMediaRecorderMp4(): boolean {
+  if (typeof MediaRecorder === 'undefined') return false;
+  const candidates = [
+    'video/mp4;codecs=avc1.42002a,mp4a.40.2',
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4;codecs=avc1.42002a',
+    'video/mp4;codecs=avc1.42E01E',
+    'video/mp4',
+  ];
+  return candidates.some((m) => {
+    try {
+      return MediaRecorder.isTypeSupported(m);
+    } catch {
+      return false;
+    }
+  });
+}
+
 async function selectWebCodecsVideoConfig(
   width: number,
   height: number,
@@ -357,11 +376,12 @@ async function selectWebCodecsVideoConfig(
 ): Promise<{
   encoderConfig: VideoEncoderConfig;
   muxerCodec: 'avc' | 'vp9' | 'av1';
+  isHardwareAccelerated: boolean;
 } | null> {
   if (!hasWebCodecsSupport()) return null;
 
   const candidates: Array<{ codec: string; muxerCodec: 'avc' | 'vp9' | 'av1' }> = [
-    // H.264 profiles ordered from high-res capable levels (5.1 / 5.0 / 4.2 / 4.0) down to 3.1
+    // H.264 profiles ordered from high-res capable levels down to 3.1
     { codec: 'avc1.640033', muxerCodec: 'avc' },
     { codec: 'avc1.4d0032', muxerCodec: 'avc' },
     { codec: 'avc1.4d002a', muxerCodec: 'avc' },
@@ -370,36 +390,44 @@ async function selectWebCodecsVideoConfig(
     { codec: 'avc1.4d001f', muxerCodec: 'avc' },
     { codec: 'avc1.42001f', muxerCodec: 'avc' },
     { codec: 'avc1.42E01E', muxerCodec: 'avc' },
-    // MP4-compatible fallback codecs when H.264 hardware/software encoder is unavailable
+    // MP4-compatible fallback codecs
     { codec: 'vp09.00.41.08', muxerCodec: 'vp9' },
     { codec: 'vp09.00.10.08', muxerCodec: 'vp9' },
     { codec: 'av01.0.08M.08', muxerCodec: 'av1' },
     { codec: 'av01.0.04M.08', muxerCodec: 'av1' },
   ];
 
-  for (const cand of candidates) {
-    const config: VideoEncoderConfig = {
-      codec: cand.codec,
-      width,
-      height,
-      bitrate,
-      framerate,
-      ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
-    };
-    try {
-      const support = await VideoEncoder.isConfigSupported(config);
-      if (support.supported) {
-        const resolvedConfig: VideoEncoderConfig = {
-          ...(support.config || config),
-          ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
-        };
-        return {
-          encoderConfig: resolvedConfig,
-          muxerCodec: cand.muxerCodec,
-        };
+  // Probe hardware-accelerated encoders first (100-300fps on Windows/Mac/Android/iOS)
+  for (const hwMode of ['prefer-hardware', 'no-preference'] as const) {
+    for (const cand of candidates) {
+      const config: VideoEncoderConfig = {
+        codec: cand.codec,
+        width,
+        height,
+        bitrate,
+        framerate,
+        latencyMode: 'realtime',
+        hardwareAcceleration: hwMode,
+        ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
+      };
+      try {
+        const support = await VideoEncoder.isConfigSupported(config);
+        if (support.supported) {
+          const resolvedConfig: VideoEncoderConfig = {
+            ...(support.config || config),
+            latencyMode: 'realtime',
+            hardwareAcceleration: hwMode,
+            ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
+          };
+          return {
+            encoderConfig: resolvedConfig,
+            muxerCodec: cand.muxerCodec,
+            isHardwareAccelerated: hwMode === 'prefer-hardware',
+          };
+        }
+      } catch {
+        // try next candidate
       }
-    } catch {
-      // try next candidate
     }
   }
 
@@ -672,6 +700,11 @@ async function encodeMp4WithWebCodecs(params: {
   customFrameImg: HTMLImageElement | null;
   onProgress: ProcessorProgressCallback;
   signal?: AbortSignal;
+  preselectedCodec?: {
+    encoderConfig: VideoEncoderConfig;
+    muxerCodec: 'avc' | 'vp9' | 'av1';
+    isHardwareAccelerated: boolean;
+  };
 }): Promise<ProcessedVideoResult> {
   const {
     item,
@@ -689,6 +722,7 @@ async function encodeMp4WithWebCodecs(params: {
     customFrameImg,
     onProgress,
     signal,
+    preselectedCodec,
   } = params;
 
   const { frameEnabled, frameStyle, brand, crop, effects, exportSettings } = settings;
@@ -697,7 +731,8 @@ async function encodeMp4WithWebCodecs(params: {
   const evenH = targetH & ~1;
   const bps = (exportSettings.bitrateMbps || 8) * 1_000_000;
 
-  const videoCodecSelection = await selectWebCodecsVideoConfig(evenW, evenH, bps, targetFps);
+  const videoCodecSelection =
+    preselectedCodec || (await selectWebCodecsVideoConfig(evenW, evenH, bps, targetFps));
   if (!videoCodecSelection) {
     throw new Error('WEBCODECS_UNAVAILABLE');
   }
@@ -814,71 +849,118 @@ async function encodeMp4WithWebCodecs(params: {
       await audioEncoder.flush();
     }
 
-    // Encode video frames at exact constant frame rate (CFR)
+    // Encode video frames at exact constant frame rate (CFR) using sequential playback (no per-frame seeking!)
     const totalFrames = Math.max(2, Math.round(effectiveOutputDuration * targetFps));
     const frameDurationUs = Math.round(1_000_000 / targetFps);
     const keyframeInterval = Math.max(targetFps, targetFps * 2);
     const filterStr = buildFilterString(effects);
+    const cachedOverlayCanvas = buildCachedFrameOverlayCanvas({
+      width: evenW,
+      height: evenH,
+      frameEnabled,
+      frameStyle,
+      brand,
+      avatarImg,
+      customFrameImg,
+      customHeadline: item.customHeadline,
+    });
+
+    await seekVideoDeterministically(videoEl, Math.max(0, Math.min(videoDur - 0.03, startTime)));
+    videoEl.muted = true;
+    videoEl.loop = false;
+    // Play slightly faster when hardware-accelerated so sequential decode never bottlenecks
+    const decodePlaybackRate = Math.max(
+      0.25,
+      Math.min(4.0, videoCodecSelection.isHardwareAccelerated ? speed * 1.5 : speed)
+    );
+    videoEl.playbackRate = decodePlaybackRate;
+    await videoEl.play().catch(() => {});
 
     let lastProgressReport = 0;
 
-    for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
-      if (signal?.aborted) {
-        throw new Error('Processamento cancelado pelo usuário');
+    try {
+      for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+        if (signal?.aborted) {
+          throw new Error('Processamento cancelado pelo usuário');
+        }
+        if (encoderError) {
+          throw encoderError;
+        }
+
+        const outputTimeSec = frameIdx / targetFps;
+        const desiredSourceTime = Math.min(endTime, startTime + outputTimeSec * speed);
+        const safeTargetTime = Math.max(0, Math.min(videoDur - 0.03, desiredSourceTime));
+
+        // Let sequential playback advance smoothly to safeTargetTime without decoder-flushing seeks
+        if (videoEl.currentTime < safeTargetTime - 0.015 && !videoEl.ended) {
+          if (videoEl.paused) {
+            await videoEl.play().catch(() => {});
+          }
+          const waitStart = performance.now();
+          while (
+            videoEl.currentTime < safeTargetTime - 0.015 &&
+            !videoEl.ended &&
+            !signal?.aborted &&
+            performance.now() - waitStart < 450
+          ) {
+            await new Promise<void>((r) => setTimeout(r, 8));
+          }
+          // Recovery seek only if decoder genuinely stalled far behind
+          if (videoEl.currentTime < safeTargetTime - 0.25 && !videoEl.ended) {
+            await seekVideoDeterministically(videoEl, safeTargetTime);
+          }
+        } else if (videoEl.currentTime > safeTargetTime + 0.08 && !videoEl.paused) {
+          // Pause momentarily if playback outpaced encoding so frames aren't skipped
+          videoEl.pause();
+        }
+
+        renderCompositeFrame({
+          ctx,
+          width: evenW,
+          height: evenH,
+          videoEl,
+          frameEnabled,
+          frameStyle,
+          brand,
+          crop,
+          effects,
+          avatarImg,
+          customFrameImg,
+          currentTime: outputTimeSec,
+          customHeadline: item.customHeadline,
+          filterStr,
+          cachedOverlayCanvas,
+        });
+
+        const vf = new VideoFrame(canvas, {
+          timestamp: frameIdx * frameDurationUs,
+          duration: frameDurationUs,
+        });
+        videoEncoder.encode(vf, { keyFrame: frameIdx % keyframeInterval === 0 });
+        vf.close();
+
+        while (videoEncoder.encodeQueueSize > 10) {
+          await new Promise<void>((r) => setTimeout(r, 6));
+        }
+
+        const now = performance.now();
+        if (now - lastProgressReport >= 140 || frameIdx === totalFrames - 1) {
+          lastProgressReport = now;
+          const pct = Math.min(93, 28 + Math.round(((frameIdx + 1) / totalFrames) * 65));
+          onProgress(
+            pct,
+            `Gerando MP4 HD (${exportSettings.resolution}): quadro ${frameIdx + 1}/${totalFrames} (${pct}%)`
+          );
+        }
+
+        if (frameIdx % 4 === 3) {
+          await new Promise<void>((r) => setTimeout(r, 0));
+        }
       }
-      if (encoderError) {
-        throw encoderError;
-      }
-
-      const outputTimeSec = frameIdx / targetFps;
-      const desiredSourceTime = Math.min(endTime, startTime + outputTimeSec * speed);
-      // Keep slightly inside video duration ceiling to avoid trailing black/empty decoded frame
-      const safeSeekTime = Math.max(0, Math.min(videoDur - 0.03, desiredSourceTime));
-
-      await seekVideoDeterministically(videoEl, safeSeekTime);
-
-      renderCompositeFrame({
-        ctx,
-        width: evenW,
-        height: evenH,
-        videoEl,
-        frameEnabled,
-        frameStyle,
-        brand,
-        crop,
-        effects,
-        avatarImg,
-        customFrameImg,
-        currentTime: outputTimeSec,
-        customHeadline: item.customHeadline,
-        filterStr,
-      });
-
-      const vf = new VideoFrame(canvas, {
-        timestamp: frameIdx * frameDurationUs,
-        duration: frameDurationUs,
-      });
-      videoEncoder.encode(vf, { keyFrame: frameIdx % keyframeInterval === 0 });
-      vf.close();
-
-      while (videoEncoder.encodeQueueSize > 6) {
-        await new Promise<void>((r) => setTimeout(r, 8));
-      }
-
-      const now = performance.now();
-      if (now - lastProgressReport >= 140 || frameIdx === totalFrames - 1) {
-        lastProgressReport = now;
-        const pct = Math.min(93, 28 + Math.round(((frameIdx + 1) / totalFrames) * 65));
-        onProgress(
-          pct,
-          `Gerando MP4 HD (${exportSettings.resolution}): quadro ${frameIdx + 1}/${totalFrames} (${pct}%)`
-        );
-      }
-
-      // Yield periodically so UI stays 100% responsive
-      if (frameIdx % 3 === 2) {
-        await new Promise<void>((r) => setTimeout(r, 0));
-      }
+    } finally {
+      try {
+        videoEl.pause();
+      } catch {}
     }
 
     onProgress(95, 'Finalizando índice e cabeçalho MP4 (Fast-Start)...');
@@ -956,7 +1038,6 @@ async function encodeWithMediaRecorderFallback(params: {
   let backgroundIntervalId: ReturnType<typeof setInterval> | null = null;
   let hardTimeoutId: ReturnType<typeof setTimeout> | null = null;
   let pendingStopTimeoutId: ReturnType<typeof setTimeout> | null = null;
-  let warmupIntervalId: ReturnType<typeof setInterval> | null = null;
   let audioCtx: AudioContext | null = null;
   let mediaRecorder: MediaRecorder | null = null;
   let canvas: HTMLCanvasElement | null = null;
@@ -975,7 +1056,6 @@ async function encodeWithMediaRecorderFallback(params: {
     if (backgroundIntervalId !== null) clearInterval(backgroundIntervalId);
     if (hardTimeoutId !== null) clearTimeout(hardTimeoutId);
     if (pendingStopTimeoutId !== null) clearTimeout(pendingStopTimeoutId);
-    if (warmupIntervalId !== null) clearInterval(warmupIntervalId);
     if (abortListener && signal) signal.removeEventListener('abort', abortListener);
 
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
@@ -1122,17 +1202,19 @@ async function encodeWithMediaRecorderFallback(params: {
 
     const mp4Prefs = hasAudioTrack
       ? [
+          'video/mp4;codecs=avc1.42002a,mp4a.40.2',
           'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
           'video/mp4;codecs=avc1.4d401f,mp4a.40.2',
-          'video/mp4;codecs=vp9,opus',
+          'video/mp4;codecs=avc1.42002a,opus',
+          'video/mp4;codecs=avc1.42E01E,opus',
           'video/mp4',
           'video/webm;codecs=vp8,opus',
           'video/webm',
         ]
       : [
+          'video/mp4;codecs=avc1.42002a',
           'video/mp4;codecs=avc1.42E01E',
           'video/mp4;codecs=avc1.4d401f',
-          'video/mp4;codecs=vp9',
           'video/mp4',
           'video/webm;codecs=vp8',
           'video/webm',
@@ -1148,10 +1230,18 @@ async function encodeWithMediaRecorderFallback(params: {
       }) || 'video/mp4';
 
     const targetFps = exportSettings.fps || 30;
-    canvasStream = canvas.captureStream(targetFps);
-    const capturedVideoTrack = canvasStream.getVideoTracks()[0] as
+    // Use manual requestFrame() (captureStream(0)) when supported to eliminate warmup duration bloat
+    canvasStream = canvas.captureStream(0);
+    let capturedVideoTrack = canvasStream.getVideoTracks()[0] as
       | (MediaStreamTrack & { requestFrame?: () => void })
       | undefined;
+    if (!capturedVideoTrack || typeof capturedVideoTrack.requestFrame !== 'function') {
+      canvasStream.getTracks().forEach((t) => t.stop());
+      canvasStream = canvas.captureStream(targetFps);
+      capturedVideoTrack = canvasStream.getVideoTracks()[0] as
+        | (MediaStreamTrack & { requestFrame?: () => void })
+        | undefined;
+    }
 
     if (dest && hasAudioTrack) {
       const audioTracks = dest.stream.getAudioTracks();
@@ -1250,6 +1340,17 @@ async function encodeWithMediaRecorderFallback(params: {
     videoEl.loop = false;
 
     const filterStr = buildFilterString(effects);
+    const cachedOverlayCanvas = buildCachedFrameOverlayCanvas({
+      width: targetW,
+      height: targetH,
+      frameEnabled,
+      frameStyle,
+      brand,
+      avatarImg,
+      customFrameImg,
+      customHeadline: item.customHeadline,
+    });
+
     const drawInitialFrame = () => {
       if (!ctx) return;
       renderCompositeFrame({
@@ -1267,27 +1368,16 @@ async function encodeWithMediaRecorderFallback(params: {
         currentTime: 0,
         customHeadline: item.customHeadline,
         filterStr,
+        cachedOverlayCanvas,
       });
       capturedVideoTrack?.requestFrame?.();
     };
 
     drawInitialFrame();
     mediaRecorder.start(200);
+    capturedVideoTrack?.requestFrame?.();
 
-    warmupIntervalId = setInterval(() => {
-      if (cleanupRun || signal?.aborted || recorderActuallyStarted) {
-        if (warmupIntervalId !== null) clearInterval(warmupIntervalId);
-        warmupIntervalId = null;
-        return;
-      }
-      drawInitialFrame();
-    }, 60);
-
-    await Promise.race([recorderStartedPromise, new Promise<void>((r) => setTimeout(r, 4500))]);
-    if (warmupIntervalId !== null) {
-      clearInterval(warmupIntervalId);
-      warmupIntervalId = null;
-    }
+    await Promise.race([recorderStartedPromise, new Promise<void>((r) => setTimeout(r, 1500))]);
 
     const recordingStartedAt = performance.now();
     if (bgmSource) bgmSource.start(0);
@@ -1319,7 +1409,7 @@ async function encodeWithMediaRecorderFallback(params: {
               mediaRecorder.stop();
             } catch {}
           }
-        }, 120);
+        }, 100);
       } else {
         try {
           mediaRecorder.stop();
@@ -1333,7 +1423,7 @@ async function encodeWithMediaRecorderFallback(params: {
     let isDrawing = false;
     let hasStopped = false;
     let drawnFrames = 1;
-    const minWallRecordMs = Math.max(350, Math.min(700, Math.round(effectiveOutputDuration * 500)));
+    const minWallRecordMs = Math.max(200, Math.min(400, Math.round(effectiveOutputDuration * 250)));
 
     const drawFrame = () => {
       if (cleanupRun || hasStopped || signal?.aborted || isDrawing || !ctx) return;
@@ -1360,6 +1450,7 @@ async function encodeWithMediaRecorderFallback(params: {
           currentTime: elapsed,
           customHeadline: item.customHeadline,
           filterStr,
+          cachedOverlayCanvas,
         });
         drawnFrames += 1;
         capturedVideoTrack?.requestFrame?.();
@@ -1367,11 +1458,11 @@ async function encodeWithMediaRecorderFallback(params: {
         const reachedVideoEnd =
           curr >= endTime - 0.04 || videoEl.ended || elapsed >= clipDuration - 0.04;
         const encoderReadyToStop =
-          (recorderActuallyStarted && totalBytesRecorded > 0) ||
-          wallElapsedMs >= Math.max(1200, effectiveOutputDuration * 1000 + 400);
+          recorderActuallyStarted ||
+          wallElapsedMs >= Math.max(800, effectiveOutputDuration * 1000);
         const enoughFramesOrTime =
           (drawnFrames >= 8 && wallElapsedMs >= minWallRecordMs && encoderReadyToStop) ||
-          wallElapsedMs >= effectiveOutputDuration * 1000 + 1800;
+          wallElapsedMs >= effectiveOutputDuration * 1000 + 1500;
 
         if (reachedVideoEnd && enoughFramesOrTime) {
           hasStopped = true;
@@ -1482,8 +1573,20 @@ export async function processVideoItem(
       throw new Error('Processamento cancelado pelo usuário');
     }
 
-    // Try Tier-1 Deterministic CFR WebCodecs MP4 first
-    if (hasWebCodecsSupport()) {
+    const evenW = targetW & ~1;
+    const evenH = targetH & ~1;
+    const bps = (exportSettings.bitrateMbps || 8) * 1_000_000;
+    const targetFps = exportSettings.fps || 30;
+    const webCodecsSelection = hasWebCodecsSupport()
+      ? await selectWebCodecsVideoConfig(evenW, evenH, bps, targetFps)
+      : null;
+
+    const nativeMp4Available = hasNativeMediaRecorderMp4();
+    // Prefer Hardware WebCodecs first (fastest on GPU); if GPU WebCodecs isn't available and browser
+    // natively supports fast MediaRecorder MP4, use MediaRecorder MP4 (~5-10x faster than CPU software WebCodecs).
+    const preferHardwareWebCodecs = Boolean(webCodecsSelection?.isHardwareAccelerated);
+
+    if (webCodecsSelection && (preferHardwareWebCodecs || !nativeMp4Available)) {
       try {
         return await encodeMp4WithWebCodecs({
           item,
@@ -1501,6 +1604,7 @@ export async function processVideoItem(
           customFrameImg,
           onProgress,
           signal,
+          preselectedCodec: webCodecsSelection,
         });
       } catch (wcErr) {
         if (signal?.aborted) {
@@ -1513,23 +1617,47 @@ export async function processVideoItem(
       }
     }
 
-    // Tier-2 Fallback: MediaRecorder MP4
-    return await encodeWithMediaRecorderFallback({
-      item,
-      settings,
-      videoEl,
-      startTime,
-      endTime,
-      clipDuration,
-      speed,
-      effectiveOutputDuration,
-      targetW,
-      targetH,
-      avatarImg,
-      customFrameImg,
-      onProgress,
-      signal,
-    });
+    // Native fast MediaRecorder MP4 (or last-resort fallback to software WebCodecs MP4 if MediaRecorder is not MP4)
+    try {
+      return await encodeWithMediaRecorderFallback({
+        item,
+        settings,
+        videoEl,
+        startTime,
+        endTime,
+        clipDuration,
+        speed,
+        effectiveOutputDuration,
+        targetW,
+        targetH,
+        avatarImg,
+        customFrameImg,
+        onProgress,
+        signal,
+      });
+    } catch (mrErr) {
+      if (!signal?.aborted && webCodecsSelection) {
+        return await encodeMp4WithWebCodecs({
+          item,
+          settings,
+          videoEl,
+          videoDur,
+          startTime,
+          endTime,
+          clipDuration,
+          speed,
+          effectiveOutputDuration,
+          targetW,
+          targetH,
+          avatarImg,
+          customFrameImg,
+          onProgress,
+          signal,
+          preselectedCodec: webCodecsSelection,
+        });
+      }
+      throw mrErr;
+    }
   } finally {
     disposeVideoElement(videoEl);
   }

@@ -156,6 +156,57 @@ export function renderBackground(
   ctx.restore();
 }
 
+export function isStaticFrameStyle(
+  style: FrameStyle,
+  frameEnabled: boolean = true
+): boolean {
+  if (!frameEnabled || style === 'none') return true;
+  // 'noticia' pulses AO VIVO and 'podcast' animates equalizer bars per frame
+  return style !== 'noticia' && style !== 'podcast';
+}
+
+/**
+ * Pre-renders static branded frame overlays once onto an offscreen canvas for fast multi-frame export.
+ */
+export function buildCachedFrameOverlayCanvas(params: {
+  width: number;
+  height: number;
+  frameEnabled: boolean;
+  frameStyle: FrameStyle;
+  brand: ProfileBrand;
+  avatarImg: HTMLImageElement | null;
+  customFrameImg: HTMLImageElement | null;
+  customHeadline?: string;
+}): HTMLCanvasElement | null {
+  if (
+    typeof document === 'undefined' ||
+    !params.frameEnabled ||
+    params.frameStyle === 'none' ||
+    !isStaticFrameStyle(params.frameStyle, params.frameEnabled)
+  ) {
+    return null;
+  }
+
+  const offscreen = document.createElement('canvas');
+  offscreen.width = params.width;
+  offscreen.height = params.height;
+  const oCtx = offscreen.getContext('2d');
+  if (!oCtx) return null;
+
+  renderFrameOverlay(
+    oCtx,
+    params.width,
+    params.height,
+    params.frameStyle,
+    params.brand,
+    params.avatarImg,
+    params.customFrameImg,
+    0,
+    params.customHeadline
+  );
+  return offscreen;
+}
+
 /**
  * Unified composite renderer shared identically by both LiveCanvasPreview and VideoProcessor.
  * Guarantees 100% visual parity between live preview and exported video across all resolutions.
@@ -175,6 +226,7 @@ export function renderCompositeFrame(params: {
   currentTime: number;
   customHeadline?: string;
   filterStr?: string;
+  cachedOverlayCanvas?: HTMLCanvasElement | null;
 }) {
   const {
     ctx,
@@ -191,6 +243,7 @@ export function renderCompositeFrame(params: {
     currentTime,
     customHeadline,
     filterStr: precomputedFilter,
+    cachedOverlayCanvas,
   } = params;
 
   // 1. Background
@@ -294,19 +347,23 @@ export function renderCompositeFrame(params: {
     }
   }
 
-  // 3. Branded Overlay Frame
+  // 3. Branded Overlay Frame (uses pre-rendered cache when available)
   if (frameEnabled) {
-    renderFrameOverlay(
-      ctx,
-      width,
-      height,
-      frameStyle,
-      brand,
-      avatarImg,
-      customFrameImg,
-      currentTime,
-      customHeadline
-    );
+    if (cachedOverlayCanvas) {
+      ctx.drawImage(cachedOverlayCanvas, 0, 0, width, height);
+    } else {
+      renderFrameOverlay(
+        ctx,
+        width,
+        height,
+        frameStyle,
+        brand,
+        avatarImg,
+        customFrameImg,
+        currentTime,
+        customHeadline
+      );
+    }
   }
 }
 
