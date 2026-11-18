@@ -82,7 +82,9 @@ export interface VideoProjectSettings {
 
 export interface VideoQueueItem {
   id: string;
-  file: File;
+  /** Original File reference in memory (released to null once cached safely in IndexedDB) */
+  file: File | null;
+  fileSize?: number;
   url: string;
   name: string;
   duration: number;
@@ -108,4 +110,8 @@ export interface VideoQueueItem {
   outputExtension?: 'mp4' | 'webm';
   errorMessage: string | null;
   outputSizeMb?: number;
+  /** True when the original video Blob is persisted in IndexedDB */
+  originalCached?: boolean;
+  /** True when the processed output MP4 Blob is persisted in IndexedDB */
+  outputCached?: boolean;
 }

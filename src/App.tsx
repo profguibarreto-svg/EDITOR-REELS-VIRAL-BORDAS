@@ -27,6 +27,23 @@ import {
   resolveVideoSettings,
 } from './utils/projectSettings';
 import {
+  VideoCacheStats,
+  clearAllVideoCache,
+  deleteOutputBlobFromCache,
+  deleteVideoCacheEntry,
+  getVideoBlob,
+  getVideoCacheStats,
+  loadAllQueueItemsFromDB,
+  saveOriginalVideoBlob,
+  saveOutputVideoBlob,
+  syncQueueRecordsToDB,
+} from './utils/videoCacheDB';
+import {
+  makeOriginalUrlKey,
+  makeOutputUrlKey,
+  videoBlobUrlManager,
+} from './utils/blobUrlManager';
+import {
   Sparkles,
   Scissors,
   Sliders,
@@ -73,6 +90,8 @@ export default function App() {
 
   // Processing state & concurrency lock
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [processingVideoId, setProcessingVideoId] = useState<string | null>(null);
+  const [cacheStats, setCacheStats] = useState<VideoCacheStats | null>(null);
   const [batchProgress, setBatchProgress] = useState<{
     current: number;
     total: number;
@@ -89,9 +108,17 @@ export default function App() {
   const queueRef = useRef<VideoQueueItem[]>(queue);
   const globalSettingsRef = useRef<VideoProjectSettings>(globalSettings);
   const knownBlobUrlsRef = useRef<Set<string>>(new Set());
+  const cacheHydratedRef = useRef<boolean>(false);
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   queueRef.current = queue;
   globalSettingsRef.current = globalSettings;
+
+  const refreshCacheStats = useCallback(() => {
+    getVideoCacheStats()
+      .then((stats) => setCacheStats(stats))
+      .catch(() => {});
+  }, []);
 
   // Persist core brand identity safely
   useEffect(() => {
@@ -115,14 +142,56 @@ export default function App() {
     globalSettings.brand.accentColor,
   ]);
 
-  // Reference-counted blob URL garbage collector
+  // Hydrate persisted queue items & metadata from IndexedDB on initial mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const restored = await loadAllQueueItemsFromDB();
+        if (cancelled) return;
+
+        if (restored.length > 0 && queueRef.current.length === 0) {
+          const first = restored[0];
+          if (first.originalCached) {
+            const firstBlob = await getVideoBlob(first.id, 'original');
+            if (!cancelled && firstBlob) {
+              first.url = videoBlobUrlManager.acquire(
+                makeOriginalUrlKey(first.id),
+                firstBlob
+              );
+            }
+          }
+          if (!cancelled) {
+            setQueue(restored);
+            setActiveVideoId(first.id);
+            setEditScope('active');
+          }
+        }
+      } catch {
+        // ignore IndexedDB read failures gracefully
+      } finally {
+        if (!cancelled) {
+          cacheHydratedRef.current = true;
+          refreshCacheStats();
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshCacheStats]);
+
+  // Reference-counted blob URL garbage collector for brand/audio & non-pooled URLs
   useEffect(() => {
     const referenced = collectReferencedBlobUrls(queue, globalSettings);
     for (const u of referenced) {
-      knownBlobUrlsRef.current.add(u);
+      if (!videoBlobUrlManager.hasUrl(u)) {
+        knownBlobUrlsRef.current.add(u);
+      }
     }
     for (const tracked of Array.from(knownBlobUrlsRef.current)) {
-      if (!referenced.has(tracked)) {
+      if (!referenced.has(tracked) && !videoBlobUrlManager.hasUrl(tracked)) {
         try {
           URL.revokeObjectURL(tracked);
         } catch {
@@ -133,12 +202,103 @@ export default function App() {
     }
   }, [queue, globalSettings]);
 
+  const cachedOriginalsCount = useMemo(
+    () => queue.filter((v) => v.originalCached).length,
+    [queue]
+  );
+
+  // LRU-bounded Object URL pool & lazy rehydration from IndexedDB
+  useEffect(() => {
+    let cancelled = false;
+    const pinnedSet = new Set<string>();
+    if (activeVideoId) pinnedSet.add(activeVideoId);
+    if (editingVideoId) pinnedSet.add(editingVideoId);
+    if (processingVideoId) pinnedSet.add(processingVideoId);
+    for (const v of queueRef.current) {
+      if (!v.originalCached) {
+        pinnedSet.add(v.id);
+      }
+    }
+    const pinnedKeys = Array.from(pinnedSet).map((id) => makeOriginalUrlKey(id));
+
+    // Evict older unpinned URLs from RAM if cached safely in IndexedDB
+    const evicted = videoBlobUrlManager.evictUnpinned(pinnedKeys);
+    if (evicted.length > 0) {
+      const evictedIds = new Set(
+        evicted
+          .filter((e) => e.key.startsWith('orig:'))
+          .map((e) => e.key.slice('orig:'.length))
+      );
+      if (evictedIds.size > 0) {
+        setQueue((prev) => {
+          let changed = false;
+          const next = prev.map((item) => {
+            if (evictedIds.has(item.id) && item.originalCached && item.url !== '') {
+              changed = true;
+              return { ...item, url: '' };
+            }
+            return item;
+          });
+          return changed ? next : prev;
+        });
+      }
+    }
+
+    // Lazily hydrate preview/active video URL if currently evicted
+    const targetId = editingVideoId || activeVideoId;
+    if (targetId) {
+      const targetItem = queueRef.current.find((v) => v.id === targetId);
+      if (targetItem && !targetItem.url && (targetItem.originalCached || targetItem.file)) {
+        const key = makeOriginalUrlKey(targetItem.id);
+        const existingUrl = videoBlobUrlManager.get(key);
+        if (existingUrl) {
+          setQueue((prev) =>
+            prev.map((v) => (v.id === targetId && !v.url ? { ...v, url: existingUrl } : v))
+          );
+        } else {
+          (async () => {
+            const blob =
+              targetItem.file ||
+              (targetItem.originalCached
+                ? await getVideoBlob(targetItem.id, 'original')
+                : null);
+            if (cancelled || !blob) return;
+            const freshUrl = videoBlobUrlManager.acquire(key, blob);
+            setQueue((prev) =>
+              prev.map((v) => (v.id === targetId && !v.url ? { ...v, url: freshUrl } : v))
+            );
+          })();
+        }
+      }
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeVideoId, editingVideoId, processingVideoId, queue.length, cachedOriginalsCount]);
+
+  // Debounced sync of queue metadata to IndexedDB
+  useEffect(() => {
+    if (!cacheHydratedRef.current) return;
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => {
+      syncQueueRecordsToDB(queueRef.current).catch(() => {});
+    }, 250);
+    return () => {
+      if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    };
+  }, [queue]);
+
   // Final cleanup on unmount
   useEffect(() => {
     return () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current);
+      }
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
+      videoBlobUrlManager.clearAll();
       for (const u of knownBlobUrlsRef.current) {
         try {
           URL.revokeObjectURL(u);
@@ -230,7 +390,7 @@ export default function App() {
     []
   );
 
-  // Add Files to Queue with safe metadata probing
+  // Add Files to Queue with safe metadata probing + IndexedDB persistence
   const handleAddFiles = async (files: FileList | File[]) => {
     setAppError(null);
     const fileArray = Array.from(files);
@@ -239,10 +399,12 @@ export default function App() {
     const templateSnapshot = cloneVideoSettings(globalSettingsRef.current);
 
     const newItems: VideoQueueItem[] = fileArray.map((file) => {
-      const url = URL.createObjectURL(file);
+      const id = `vid_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      const url = videoBlobUrlManager.acquire(makeOriginalUrlKey(id), file);
       return {
-        id: `vid_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+        id,
         file,
+        fileSize: file.size,
         url,
         name: file.name,
         duration: 0,
@@ -256,6 +418,8 @@ export default function App() {
         statusText: file.size === 0 ? 'Arquivo vazio' : 'Lendo metadados...',
         outputBlob: null,
         outputUrl: null,
+        originalCached: false,
+        outputCached: false,
         errorMessage:
           file.size === 0
             ? 'Arquivo com 0 bytes. Verifique se o vídeo não está vazio ou corrompido.'
@@ -269,12 +433,16 @@ export default function App() {
       setEditScope('active');
     }
 
-    // Probe each video cleanly and isolate corrupted/unsupported files per item
+    // Probe metadata and persist original Blob to IndexedDB in parallel per file
     await Promise.all(
       newItems.map(async (item) => {
-        if (item.status === 'error') return;
+        if (item.status === 'error' || !item.file) return;
+        const sourceFile = item.file;
         try {
-          const meta = await probeVideoMetadata(item.url);
+          const [meta, savedToDb] = await Promise.all([
+            probeVideoMetadata(item.url),
+            saveOriginalVideoBlob(item.id, sourceFile),
+          ]);
           setQueue((prev) =>
             prev.map((v) =>
               v.id === item.id
@@ -287,10 +455,14 @@ export default function App() {
                     trim: { startTime: 0, endTime: meta.duration },
                     statusText: undefined,
                     errorMessage: null,
+                    originalCached: savedToDb,
+                    // Release heavy File reference from RAM once safely stored in IndexedDB
+                    file: savedToDb ? null : v.file,
                   }
                 : v
             )
           );
+          if (savedToDb) refreshCacheStats();
         } catch (err) {
           const msg =
             err instanceof Error
@@ -317,6 +489,10 @@ export default function App() {
     if (isProcessing && queue.find((v) => v.id === id)?.status === 'processing') {
       return;
     }
+    videoBlobUrlManager.release(makeOriginalUrlKey(id));
+    videoBlobUrlManager.release(makeOutputUrlKey(id));
+    deleteVideoCacheEntry(id).then(refreshCacheStats).catch(() => {});
+
     setQueue((prev) => {
       const filtered = prev.filter((item) => item.id !== id);
       if (activeVideoId === id) {
@@ -329,13 +505,50 @@ export default function App() {
     });
   };
 
+  const handleClearCache = async () => {
+    if (processingLockRef.current || isProcessing) return;
+    videoBlobUrlManager.clearAll();
+    setQueue([]);
+    setActiveVideoId(null);
+    setEditingVideoId(null);
+    await clearAllVideoCache();
+    refreshCacheStats();
+  };
+
   const handleLoadDemoSample = async () => {
     setAppError(null);
     try {
       const demo = await createSyntheticDemoVideo(globalSettingsRef.current);
-      setQueue((prev) => [...prev, demo]);
-      setActiveVideoId(demo.id);
+      if (demo.url) {
+        videoBlobUrlManager.register(makeOriginalUrlKey(demo.id), demo.url);
+      }
+      const demoFile = demo.file;
+      const demoWithSize: VideoQueueItem = {
+        ...demo,
+        fileSize: demoFile?.size ?? 0,
+        originalCached: false,
+        outputCached: false,
+      };
+      setQueue((prev) => [...prev, demoWithSize]);
+      setActiveVideoId(demoWithSize.id);
       setEditScope('active');
+
+      if (demoFile) {
+        saveOriginalVideoBlob(demoWithSize.id, demoFile)
+          .then((saved) => {
+            if (saved) {
+              setQueue((prev) =>
+                prev.map((v) =>
+                  v.id === demoWithSize.id
+                    ? { ...v, originalCached: true, file: null }
+                    : v
+                )
+              );
+              refreshCacheStats();
+            }
+          })
+          .catch(() => {});
+      }
     } catch (err) {
       setAppError({
         title: 'Falha ao gerar vídeo de demonstração',
@@ -469,7 +682,7 @@ export default function App() {
     const currentQueue = queueRef.current;
     const itemsToRun = targetIds
       ? currentQueue.filter((item) => targetIds.includes(item.id))
-      : currentQueue.filter((item) => item.file && item.url);
+      : currentQueue.filter((item) => Boolean(item.url || item.file || item.originalCached));
 
     if (itemsToRun.length === 0) return;
 
@@ -489,6 +702,7 @@ export default function App() {
         const latestItem = queueRef.current.find((v) => v.id === itemsToRun[i].id);
         if (!latestItem) continue;
 
+        setProcessingVideoId(latestItem.id);
         setActiveVideoId(latestItem.id);
         setBatchProgress({
           current: i + 1,
@@ -496,7 +710,10 @@ export default function App() {
           currentName: latestItem.name,
         });
 
-        // Clear any stale output reference on this item and mark processing
+        // Clear any stale output reference & IndexedDB output on this item before re-processing
+        await deleteOutputBlobFromCache(latestItem.id);
+        videoBlobUrlManager.release(makeOutputUrlKey(latestItem.id));
+
         setQueue((q) =>
           q.map((v) =>
             v.id === latestItem.id
@@ -508,6 +725,7 @@ export default function App() {
                   errorMessage: null,
                   outputBlob: null,
                   outputUrl: null,
+                  outputCached: false,
                 }
               : v
           )
@@ -529,6 +747,20 @@ export default function App() {
             controller.signal
           );
 
+          const outputSizeMb = +(result.outputBlob.size / (1024 * 1024)).toFixed(2);
+          const savedOutputToDb = await saveOutputVideoBlob(
+            latestItem.id,
+            result.outputBlob,
+            result.extension
+          );
+
+          if (savedOutputToDb && result.outputUrl) {
+            // Release output Blob & URL from JS/RAM once safely persisted to IndexedDB
+            try {
+              URL.revokeObjectURL(result.outputUrl);
+            } catch {}
+          }
+
           setQueue((q) =>
             q.map((v) =>
               v.id === latestItem.id
@@ -537,16 +769,18 @@ export default function App() {
                     status: 'done',
                     progress: 100,
                     statusText: `Concluído (${result.formatLabel})`,
-                    outputBlob: result.outputBlob,
-                    outputUrl: result.outputUrl,
+                    outputBlob: savedOutputToDb ? null : result.outputBlob,
+                    outputUrl: savedOutputToDb ? null : result.outputUrl,
+                    outputCached: savedOutputToDb,
                     outputMimeType: result.mimeType,
                     outputExtension: result.extension,
-                    outputSizeMb: +(result.outputBlob.size / (1024 * 1024)).toFixed(2),
+                    outputSizeMb,
                     errorMessage: null,
                   }
                 : v
             )
           );
+          refreshCacheStats();
         } catch (err) {
           if (controller.signal.aborted) {
             setQueue((q) =>
@@ -596,8 +830,10 @@ export default function App() {
     } finally {
       processingLockRef.current = false;
       abortControllerRef.current = null;
+      setProcessingVideoId(null);
       setIsProcessing(false);
       setBatchProgress(null);
+      syncQueueRecordsToDB(queueRef.current).catch(() => {});
     }
   };
 
@@ -610,9 +846,9 @@ export default function App() {
     }
   };
 
-  const handleDownloadSingle = (item: VideoQueueItem) => {
+  const handleDownloadSingle = async (item: VideoQueueItem) => {
     try {
-      downloadSingleVideo(item);
+      await downloadSingleVideo(item);
     } catch (err) {
       setAppError({
         title: 'Falha ao baixar vídeo',
@@ -945,6 +1181,8 @@ export default function App() {
                       onLoadDemoSample={handleLoadDemoSample}
                       onUpdateItemHeadline={handleUpdateItemHeadline}
                       onBatchSetHeadlines={handleBatchSetHeadlines}
+                      onClearCache={handleClearCache}
+                      cacheStats={cacheStats}
                       detectedFormatLabel={detectedFormat.label}
                     />
                   )}

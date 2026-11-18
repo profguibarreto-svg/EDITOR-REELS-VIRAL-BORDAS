@@ -5,6 +5,7 @@ import { VideoTrimmerCrop } from './VideoTrimmerCrop';
 import { EffectsAudioPanel } from './EffectsAudioPanel';
 import { ExportSettingsPanel } from './ExportSettingsPanel';
 import { getModifiedSections } from '../utils/projectSettings';
+import { isVideoOutputReady } from '../utils/exportZip';
 import {
   ArrowLeft,
   Sparkles,
@@ -102,7 +103,9 @@ export const IndividualVideoEditor: React.FC<IndividualVideoEditorProps> = ({
   ];
 
   const outputLabel =
-    item.outputExtension === 'mp4' || item.outputBlob?.type.includes('mp4')
+    item.outputExtension === 'mp4' ||
+    item.outputMimeType?.includes('mp4') ||
+    item.outputBlob?.type.includes('mp4')
       ? 'Baixar MP4'
       : 'Baixar WebM';
 
@@ -139,7 +142,7 @@ export const IndividualVideoEditor: React.FC<IndividualVideoEditorProps> = ({
 
           {/* Primary Single Video Actions */}
           <div className="flex items-center gap-2 flex-wrap">
-            {item.status === 'done' && item.outputBlob && (
+            {isVideoOutputReady(item) && (
               <button
                 type="button"
                 onClick={() => onDownloadSingle(item)}

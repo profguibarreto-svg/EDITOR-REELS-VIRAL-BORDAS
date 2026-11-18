@@ -15,10 +15,12 @@ import {
   X,
   Edit3,
   RotateCcw,
+  Database,
 } from 'lucide-react';
 import { formatTime } from '../utils/geometryMath';
-import { downloadLinuxPackage } from '../utils/exportZip';
+import { downloadLinuxPackage, isVideoOutputReady } from '../utils/exportZip';
 import { getModifiedSections } from '../utils/projectSettings';
+import { VideoCacheStats, formatBytesCompact } from '../utils/videoCacheDB';
 
 interface BatchQueueProps {
   queue: VideoQueueItem[];
@@ -38,6 +40,8 @@ interface BatchQueueProps {
   onLoadDemoSample: () => void;
   onUpdateItemHeadline?: (id: string, headline: string) => void;
   onBatchSetHeadlines?: (headlines: string[]) => void;
+  onClearCache?: () => void;
+  cacheStats?: VideoCacheStats | null;
   detectedFormatLabel: string;
 }
 
@@ -59,6 +63,8 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
   onLoadDemoSample,
   onUpdateItemHeadline,
   onBatchSetHeadlines,
+  onClearCache,
+  cacheStats,
   detectedFormatLabel,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -90,7 +96,7 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
     setShowBatchTitlesModal(false);
   };
 
-  const completedCount = queue.filter((i) => i.status === 'done' && i.outputBlob).length;
+  const completedCount = queue.filter(isVideoOutputReady).length;
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-5">
@@ -141,6 +147,19 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
             <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
             {queue.length === 0 ? 'Carregar Vídeo de Exemplo' : '+ Vídeo Exemplo'}
           </button>
+
+          {queue.length > 0 && onClearCache && (
+            <button
+              type="button"
+              onClick={onClearCache}
+              disabled={isProcessing}
+              title="Limpar todos os vídeos da fila e liberar o cache IndexedDB"
+              className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-red-950/60 text-slate-300 hover:text-red-300 border border-slate-700 hover:border-red-500/40 text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-50"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Limpar Fila
+            </button>
+          )}
         </div>
       </div>
 
@@ -236,7 +255,10 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
             const itemRes = item.settings?.exportSettings?.resolution || globalSettings.exportSettings.resolution;
             const itemRatio = item.settings?.exportSettings?.aspectRatio || globalSettings.exportSettings.aspectRatio;
             const itemExt =
-              item.outputExtension || (item.outputBlob?.type.includes('mp4') ? 'mp4' : 'webm');
+              item.outputExtension ||
+              (item.outputMimeType?.includes('mp4') || item.outputBlob?.type.includes('mp4')
+                ? 'mp4'
+                : 'webm');
 
             return (
               <div
@@ -348,7 +370,7 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
                       </span>
                     )}
 
-                    {item.status === 'done' && item.outputBlob && (
+                    {isVideoOutputReady(item) && (
                       <button
                         type="button"
                         onClick={() => onDownloadSingle(item)}
@@ -493,8 +515,19 @@ export const BatchQueue: React.FC<BatchQueueProps> = ({
       {/* Batch Processing Bottom Bar */}
       {queue.length > 0 && (
         <div className="pt-2 flex flex-col sm:flex-row items-center justify-between gap-3 border-t border-slate-800">
-          <div className="text-xs text-slate-400 w-full sm:w-auto text-center sm:text-left">
-            Concluídos: <strong className="text-emerald-400">{completedCount}</strong> de {queue.length}
+          <div className="text-xs text-slate-400 w-full sm:w-auto text-center sm:text-left flex items-center justify-center sm:justify-start gap-2 flex-wrap">
+            <span>
+              Concluídos: <strong className="text-emerald-400">{completedCount}</strong> de {queue.length}
+            </span>
+            {cacheStats && cacheStats.totalBytes > 0 && (
+              <span
+                title="Vídeos armazenados em cache persistente no IndexedDB (libera memória RAM)"
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 border border-slate-700 text-[10px] text-slate-300 font-mono"
+              >
+                <Database className="w-3 h-3 text-cyan-400" />
+                Cache: {formatBytesCompact(cacheStats.totalBytes)}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2 w-full sm:w-auto justify-end flex-wrap">

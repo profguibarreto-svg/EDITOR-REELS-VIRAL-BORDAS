@@ -1,13 +1,29 @@
 import JSZip from 'jszip';
 import { VideoQueueItem } from '../types/video';
+import { getVideoBlob } from './videoCacheDB';
+
+export function isVideoOutputReady(item: VideoQueueItem): boolean {
+  return (
+    item.status === 'done' &&
+    (Boolean(item.outputBlob && item.outputBlob.size > 0) || Boolean(item.outputCached))
+  );
+}
+
+async function resolveOutputBlob(item: VideoQueueItem): Promise<Blob | null> {
+  if (item.outputBlob && item.outputBlob.size > 0) {
+    return item.outputBlob;
+  }
+  if (item.outputCached) {
+    return getVideoBlob(item.id, 'output');
+  }
+  return null;
+}
 
 export async function downloadAllVideosAsZip(
   items: VideoQueueItem[],
   onProgress?: (percent: number) => void
 ): Promise<void> {
-  const completed = items.filter(
-    (item) => item.status === 'done' && item.outputBlob && item.outputBlob.size > 0
-  );
+  const completed = items.filter(isVideoOutputReady);
   if (completed.length === 0) {
     throw new Error('Nenhum vídeo concluído disponível para compactar em ZIP.');
   }
@@ -15,15 +31,23 @@ export async function downloadAllVideosAsZip(
   const zip = new JSZip();
   const folder = zip.folder('cortes_wifive_pro_hd');
 
-  completed.forEach((item, index) => {
+  let addedCount = 0;
+  for (let index = 0; index < completed.length; index++) {
+    const item = completed[index];
+    const blob = await resolveOutputBlob(item);
+    if (!blob || blob.size === 0 || !folder) continue;
+
     const cleanName = item.name.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
     const ext =
-      item.outputExtension || (item.outputBlob?.type.includes('mp4') ? 'mp4' : 'webm');
+      item.outputExtension || (blob.type.includes('mp4') ? 'mp4' : 'webm');
     const fileName = `${String(index + 1).padStart(2, '0')}_${cleanName}_wifive_pro.${ext}`;
-    if (folder && item.outputBlob) {
-      folder.file(fileName, item.outputBlob);
-    }
-  });
+    folder.file(fileName, blob);
+    addedCount += 1;
+  }
+
+  if (addedCount === 0) {
+    throw new Error('Os arquivos processados não foram encontrados no cache local.');
+  }
 
   const zipBlob = await zip.generateAsync({ type: 'blob' }, (metadata) => {
     if (onProgress) {
@@ -41,13 +65,16 @@ export async function downloadAllVideosAsZip(
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-export function downloadSingleVideo(item: VideoQueueItem): void {
-  if (!item.outputBlob || item.outputBlob.size === 0) return;
+export async function downloadSingleVideo(item: VideoQueueItem): Promise<void> {
+  const blob = await resolveOutputBlob(item);
+  if (!blob || blob.size === 0) {
+    throw new Error('Arquivo processado indisponível no cache. Processe o vídeo novamente.');
+  }
   const cleanName = item.name.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
   const ext =
-    item.outputExtension || (item.outputBlob.type.includes('mp4') ? 'mp4' : 'webm');
+    item.outputExtension || (blob.type.includes('mp4') ? 'mp4' : 'webm');
   const shouldRevoke = !item.outputUrl;
-  const url = item.outputUrl || URL.createObjectURL(item.outputBlob);
+  const url = item.outputUrl || URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = `${cleanName}_wifive_pro_hd.${ext}`;

@@ -9,6 +9,8 @@ import {
   renderCompositeFrame,
 } from './frameRenderer';
 import { generateSyntheticTrackBuffer } from './audioTracks';
+import { getVideoBlob } from './videoCacheDB';
+import { makeOriginalUrlKey, videoBlobUrlManager } from './blobUrlManager';
 
 export interface ProcessorProgressCallback {
   (progress: number, statusText: string): void;
@@ -607,9 +609,16 @@ async function buildOfflineMixedAudioBuffer(
 
   if (wantsOriginalAudio) {
     try {
-      const sourceBytes = item.file
-        ? await item.file.arrayBuffer()
-        : await (await fetch(item.url)).arrayBuffer();
+      const sourceBlob =
+        item.file || (item.originalCached ? await getVideoBlob(item.id, 'original') : null);
+      const sourceBytes = sourceBlob
+        ? await sourceBlob.arrayBuffer()
+        : item.url
+        ? await (await fetch(item.url)).arrayBuffer()
+        : null;
+      if (!sourceBytes) {
+        throw new Error('Fonte de áudio original indisponível.');
+      }
       const decodedOriginal = await offlineCtx.decodeAudioData(sourceBytes.slice(0));
       if (decodedOriginal && decodedOriginal.length > 0) {
         const srcNode = offlineCtx.createBufferSource();
@@ -1519,9 +1528,25 @@ export async function processVideoItem(
   onProgress: ProcessorProgressCallback,
   signal?: AbortSignal
 ): Promise<ProcessedVideoResult> {
-  if (!item || !item.url) {
+  if (!item) {
     throw new Error('Arquivo de vídeo inválido ou ausente.');
   }
+
+  let resolvedUrl = item.url || videoBlobUrlManager.get(makeOriginalUrlKey(item.id)) || '';
+  if (!resolvedUrl) {
+    const cachedBlob =
+      item.file || (item.originalCached ? await getVideoBlob(item.id, 'original') : null);
+    if (cachedBlob) {
+      resolvedUrl = videoBlobUrlManager.acquire(makeOriginalUrlKey(item.id), cachedBlob);
+    }
+  }
+
+  if (!resolvedUrl) {
+    throw new Error('Arquivo de vídeo inválido ou ausente no cache.');
+  }
+
+  const resolvedItem: VideoQueueItem =
+    item.url === resolvedUrl ? item : { ...item, url: resolvedUrl };
 
   let videoEl: HTMLVideoElement | null = null;
 
@@ -1531,7 +1556,7 @@ export async function processVideoItem(
     }
 
     onProgress(5, 'Validando vídeo e preparando codificador MP4...');
-    videoEl = await loadAndValidateVideoElement(item.url, signal);
+    videoEl = await loadAndValidateVideoElement(resolvedUrl, signal);
 
     if (signal?.aborted) {
       throw new Error('Processamento cancelado pelo usuário');
@@ -1589,7 +1614,7 @@ export async function processVideoItem(
     if (webCodecsSelection && (preferHardwareWebCodecs || !nativeMp4Available)) {
       try {
         return await encodeMp4WithWebCodecs({
-          item,
+          item: resolvedItem,
           settings,
           videoEl,
           videoDur,
@@ -1620,7 +1645,7 @@ export async function processVideoItem(
     // Native fast MediaRecorder MP4 (or last-resort fallback to software WebCodecs MP4 if MediaRecorder is not MP4)
     try {
       return await encodeWithMediaRecorderFallback({
-        item,
+        item: resolvedItem,
         settings,
         videoEl,
         startTime,
@@ -1638,7 +1663,7 @@ export async function processVideoItem(
     } catch (mrErr) {
       if (!signal?.aborted && webCodecsSelection) {
         return await encodeMp4WithWebCodecs({
-          item,
+          item: resolvedItem,
           settings,
           videoEl,
           videoDur,

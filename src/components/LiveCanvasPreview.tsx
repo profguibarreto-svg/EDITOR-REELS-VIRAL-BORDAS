@@ -3,6 +3,7 @@ import { VideoProjectSettings, VideoQueueItem } from '../types/video';
 import { formatTime } from '../utils/geometryMath';
 import { buildFilterString, renderCompositeFrame } from '../utils/frameRenderer';
 import { getSupportedMimeType } from '../utils/videoProcessor';
+import { isVideoOutputReady } from '../utils/exportZip';
 import {
   Play,
   Pause,
@@ -322,6 +323,7 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
   const detectedFormat = getSupportedMimeType();
   const isOutputWebm =
     activeItem?.outputExtension === 'webm' ||
+    Boolean(activeItem?.outputMimeType?.includes('webm')) ||
     Boolean(activeItem?.outputBlob?.type.includes('webm'));
   const outputLabel = isOutputWebm ? 'Baixar WebM HD' : 'Baixar MP4 HD';
 
@@ -472,7 +474,7 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
             </span>
           </div>
 
-          {activeItem.status === 'done' && activeItem.outputBlob && (
+          {activeItem && isVideoOutputReady(activeItem) && (
             <button
               type="button"
               onClick={onDownloadActive}
