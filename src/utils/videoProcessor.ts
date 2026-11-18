@@ -11,6 +11,14 @@ import {
 import { generateSyntheticTrackBuffer } from './audioTracks';
 import { getVideoBlob } from './videoCacheDB';
 import { makeOriginalUrlKey, videoBlobUrlManager } from './blobUrlManager';
+import {
+  buildWebCodecsCandidateSpecs,
+  computeCfrFrameTimestampUs,
+  computeAdaptivePlaybackRate,
+  computeFrameWaitCapMs,
+  evaluateFrameSyncAction,
+  shouldUseDeterministicSeek,
+} from './frameSyncMath';
 
 export interface ProcessorProgressCallback {
   (progress: number, statusText: string): void;
@@ -352,24 +360,6 @@ function loadOptionalImage(src: string | null): Promise<HTMLImageElement | null>
   });
 }
 
-function hasNativeMediaRecorderMp4(): boolean {
-  if (typeof MediaRecorder === 'undefined') return false;
-  const candidates = [
-    'video/mp4;codecs=avc1.42002a,mp4a.40.2',
-    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
-    'video/mp4;codecs=avc1.42002a',
-    'video/mp4;codecs=avc1.42E01E',
-    'video/mp4',
-  ];
-  return candidates.some((m) => {
-    try {
-      return MediaRecorder.isTypeSupported(m);
-    } catch {
-      return false;
-    }
-  });
-}
-
 async function selectWebCodecsVideoConfig(
   width: number,
   height: number,
@@ -382,54 +372,36 @@ async function selectWebCodecsVideoConfig(
 } | null> {
   if (!hasWebCodecsSupport()) return null;
 
-  const candidates: Array<{ codec: string; muxerCodec: 'avc' | 'vp9' | 'av1' }> = [
-    // H.264 profiles ordered from high-res capable levels down to 3.1
-    { codec: 'avc1.640033', muxerCodec: 'avc' },
-    { codec: 'avc1.4d0032', muxerCodec: 'avc' },
-    { codec: 'avc1.4d002a', muxerCodec: 'avc' },
-    { codec: 'avc1.4d0028', muxerCodec: 'avc' },
-    { codec: 'avc1.420028', muxerCodec: 'avc' },
-    { codec: 'avc1.4d001f', muxerCodec: 'avc' },
-    { codec: 'avc1.42001f', muxerCodec: 'avc' },
-    { codec: 'avc1.42E01E', muxerCodec: 'avc' },
-    // MP4-compatible fallback codecs
-    { codec: 'vp09.00.41.08', muxerCodec: 'vp9' },
-    { codec: 'vp09.00.10.08', muxerCodec: 'vp9' },
-    { codec: 'av01.0.08M.08', muxerCodec: 'av1' },
-    { codec: 'av01.0.04M.08', muxerCodec: 'av1' },
-  ];
+  const candidates = buildWebCodecsCandidateSpecs();
 
-  // Probe hardware-accelerated encoders first (100-300fps on Windows/Mac/Android/iOS)
-  for (const hwMode of ['prefer-hardware', 'no-preference'] as const) {
-    for (const cand of candidates) {
-      const config: VideoEncoderConfig = {
-        codec: cand.codec,
-        width,
-        height,
-        bitrate,
-        framerate,
-        latencyMode: 'realtime',
-        hardwareAcceleration: hwMode,
-        ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
-      };
-      try {
-        const support = await VideoEncoder.isConfigSupported(config);
-        if (support.supported) {
-          const resolvedConfig: VideoEncoderConfig = {
-            ...(support.config || config),
-            latencyMode: 'realtime',
-            hardwareAcceleration: hwMode,
-            ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
-          };
-          return {
-            encoderConfig: resolvedConfig,
-            muxerCodec: cand.muxerCodec,
-            isHardwareAccelerated: hwMode === 'prefer-hardware',
-          };
-        }
-      } catch {
-        // try next candidate
+  for (const cand of candidates) {
+    const config: VideoEncoderConfig = {
+      codec: cand.codec,
+      width,
+      height,
+      bitrate,
+      framerate,
+      latencyMode: 'realtime',
+      hardwareAcceleration: cand.hardwareAcceleration,
+      ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
+    };
+    try {
+      const support = await VideoEncoder.isConfigSupported(config);
+      if (support.supported) {
+        const resolvedConfig: VideoEncoderConfig = {
+          ...(support.config || config),
+          latencyMode: 'realtime',
+          hardwareAcceleration: cand.hardwareAcceleration,
+          ...(cand.muxerCodec === 'avc' ? { avc: { format: 'avc' as const } } : {}),
+        };
+        return {
+          encoderConfig: resolvedConfig,
+          muxerCodec: cand.muxerCodec,
+          isHardwareAccelerated: cand.hardwareAcceleration === 'prefer-hardware',
+        };
       }
+    } catch {
+      // try next candidate
     }
   }
 
@@ -858,10 +830,9 @@ async function encodeMp4WithWebCodecs(params: {
       await audioEncoder.flush();
     }
 
-    // Encode video frames at exact constant frame rate (CFR) using sequential playback (no per-frame seeking!)
+    // Encode video frames at exact constant frame rate (CFR) using adaptive rate-locked decoding
     const totalFrames = Math.max(2, Math.round(effectiveOutputDuration * targetFps));
-    const frameDurationUs = Math.round(1_000_000 / targetFps);
-    const keyframeInterval = Math.max(targetFps, targetFps * 2);
+    const keyframeInterval = Math.max(15, targetFps);
     const filterStr = buildFilterString(effects);
     const cachedOverlayCanvas = buildCachedFrameOverlayCanvas({
       width: evenW,
@@ -874,16 +845,33 @@ async function encodeMp4WithWebCodecs(params: {
       customHeadline: item.customHeadline,
     });
 
-    await seekVideoDeterministically(videoEl, Math.max(0, Math.min(videoDur - 0.03, startTime)));
+    // Ensure videoEl stays connected offscreen during sequential decode so Chromium/WebKit compositor updates textures reliably
+    const wasConnected = videoEl.isConnected;
+    if (!wasConnected && document.body) {
+      videoEl.style.position = 'fixed';
+      videoEl.style.top = '0px';
+      videoEl.style.left = '0px';
+      videoEl.style.width = '2px';
+      videoEl.style.height = '2px';
+      videoEl.style.opacity = '0.001';
+      videoEl.style.pointerEvents = 'none';
+      videoEl.style.zIndex = '-1';
+      document.body.appendChild(videoEl);
+    }
+
+    await seekVideoDeterministically(videoEl, Math.max(0, Math.min(videoDur - 0.012, startTime)));
     videoEl.muted = true;
     videoEl.loop = false;
-    // Play slightly faster when hardware-accelerated so sequential decode never bottlenecks
-    const decodePlaybackRate = Math.max(
-      0.25,
-      Math.min(4.0, videoCodecSelection.isHardwareAccelerated ? speed * 1.5 : speed)
-    );
-    videoEl.playbackRate = decodePlaybackRate;
-    await videoEl.play().catch(() => {});
+
+    const sourceStepSec = speed / targetFps;
+    let avgFrameWorkMs = videoCodecSelection.isHardwareAccelerated ? 18 : 95;
+    let rateScale = 0.92;
+    videoEl.playbackRate = computeAdaptivePlaybackRate({
+      speed,
+      targetFps,
+      avgFrameWorkMs,
+      rateScale,
+    });
 
     let lastProgressReport = 0;
 
@@ -898,31 +886,88 @@ async function encodeMp4WithWebCodecs(params: {
 
         const outputTimeSec = frameIdx / targetFps;
         const desiredSourceTime = Math.min(endTime, startTime + outputTimeSec * speed);
-        const safeTargetTime = Math.max(0, Math.min(videoDur - 0.03, desiredSourceTime));
+        const safeTargetTime = Math.max(0, Math.min(videoDur - 0.012, desiredSourceTime));
 
-        // Let sequential playback advance smoothly to safeTargetTime without decoder-flushing seeks
-        if (videoEl.currentTime < safeTargetTime - 0.015 && !videoEl.ended) {
-          if (videoEl.paused) {
+        const useDeterministic = shouldUseDeterministicSeek({
+          isHardwareAccelerated: videoCodecSelection.isHardwareAccelerated,
+          avgFrameWorkMs,
+          speed,
+          targetFps,
+        });
+
+        if (useDeterministic) {
+          if (!videoEl.paused) {
+            videoEl.pause();
+          }
+          await seekVideoDeterministically(videoEl, safeTargetTime);
+        } else if (frameIdx === 0) {
+          await seekVideoDeterministically(videoEl, safeTargetTime);
+          // Start playback right after framing frame 0 so frame 1+ decode smoothly in lockstep
+          videoEl.playbackRate = computeAdaptivePlaybackRate({
+            speed,
+            targetFps,
+            avgFrameWorkMs,
+            rateScale,
+          });
+          await videoEl.play().catch(() => {});
+        } else {
+          const desiredRate = computeAdaptivePlaybackRate({
+            speed,
+            targetFps,
+            avgFrameWorkMs,
+            rateScale,
+          });
+          if (Math.abs(videoEl.playbackRate - desiredRate) > 0.03) {
+            videoEl.playbackRate = desiredRate;
+          }
+
+          const action = evaluateFrameSyncAction({
+            currentTime: videoEl.currentTime,
+            targetTime: safeTargetTime,
+            sourceStepSec,
+            videoEnded: videoEl.ended,
+          });
+
+          if (action === 'seek-back') {
+            if (!videoEl.paused) videoEl.pause();
+            await seekVideoDeterministically(videoEl, safeTargetTime);
+            rateScale = Math.max(0.7, rateScale * 0.88);
+            videoEl.playbackRate = computeAdaptivePlaybackRate({
+              speed,
+              targetFps,
+              avgFrameWorkMs,
+              rateScale,
+            });
+          } else if (action === 'pause-near') {
+            if (!videoEl.paused) videoEl.pause();
+            rateScale = Math.max(0.72, rateScale * 0.94);
+          } else if (action === 'wait-or-seek') {
+            if (videoEl.paused && !videoEl.ended) {
+              await videoEl.play().catch(() => {});
+            }
+            const waitCapMs = computeFrameWaitCapMs(sourceStepSec, videoEl.playbackRate);
+            const waitStart = performance.now();
+            const lagFloor = safeTargetTime - Math.max(0.012, sourceStepSec * 0.45);
+            while (
+              videoEl.currentTime < lagFloor &&
+              !videoEl.ended &&
+              !signal?.aborted &&
+              performance.now() - waitStart < waitCapMs
+            ) {
+              await new Promise<void>((r) => setTimeout(r, 4));
+            }
+            if (
+              videoEl.currentTime < safeTargetTime - Math.max(0.025, sourceStepSec * 0.8) &&
+              !videoEl.ended
+            ) {
+              await seekVideoDeterministically(videoEl, safeTargetTime);
+            }
+          } else if (videoEl.paused && !videoEl.ended) {
             await videoEl.play().catch(() => {});
           }
-          const waitStart = performance.now();
-          while (
-            videoEl.currentTime < safeTargetTime - 0.015 &&
-            !videoEl.ended &&
-            !signal?.aborted &&
-            performance.now() - waitStart < 450
-          ) {
-            await new Promise<void>((r) => setTimeout(r, 8));
-          }
-          // Recovery seek only if decoder genuinely stalled far behind
-          if (videoEl.currentTime < safeTargetTime - 0.25 && !videoEl.ended) {
-            await seekVideoDeterministically(videoEl, safeTargetTime);
-          }
-        } else if (videoEl.currentTime > safeTargetTime + 0.08 && !videoEl.paused) {
-          // Pause momentarily if playback outpaced encoding so frames aren't skipped
-          videoEl.pause();
         }
 
+        const renderWorkStartMs = performance.now();
         renderCompositeFrame({
           ctx,
           width: evenW,
@@ -941,15 +986,21 @@ async function encodeMp4WithWebCodecs(params: {
           cachedOverlayCanvas,
         });
 
+        const { timestampUs, durationUs } = computeCfrFrameTimestampUs(frameIdx, targetFps);
         const vf = new VideoFrame(canvas, {
-          timestamp: frameIdx * frameDurationUs,
-          duration: frameDurationUs,
+          timestamp: timestampUs,
+          duration: durationUs,
         });
         videoEncoder.encode(vf, { keyFrame: frameIdx % keyframeInterval === 0 });
         vf.close();
 
-        while (videoEncoder.encodeQueueSize > 10) {
-          await new Promise<void>((r) => setTimeout(r, 6));
+        while (videoEncoder.encodeQueueSize > 8) {
+          await new Promise<void>((r) => setTimeout(r, 4));
+        }
+
+        const frameWorkMs = performance.now() - renderWorkStartMs;
+        if (frameIdx > 0) {
+          avgFrameWorkMs = avgFrameWorkMs * 0.75 + frameWorkMs * 0.25;
         }
 
         const now = performance.now();
@@ -962,7 +1013,7 @@ async function encodeMp4WithWebCodecs(params: {
           );
         }
 
-        if (frameIdx % 4 === 3) {
+        if (frameIdx % 2 === 1) {
           await new Promise<void>((r) => setTimeout(r, 0));
         }
       }
@@ -970,6 +1021,11 @@ async function encodeMp4WithWebCodecs(params: {
       try {
         videoEl.pause();
       } catch {}
+      if (!wasConnected && videoEl.parentNode) {
+        try {
+          videoEl.parentNode.removeChild(videoEl);
+        } catch {}
+      }
     }
 
     onProgress(95, 'Finalizando índice e cabeçalho MP4 (Fast-Start)...');
@@ -1239,18 +1295,11 @@ async function encodeWithMediaRecorderFallback(params: {
       }) || 'video/mp4';
 
     const targetFps = exportSettings.fps || 30;
-    // Use manual requestFrame() (captureStream(0)) when supported to eliminate warmup duration bloat
-    canvasStream = canvas.captureStream(0);
-    let capturedVideoTrack = canvasStream.getVideoTracks()[0] as
+    // Use continuous FPS stream capture so MediaRecorder never drops to 2 frames under captureStream(0)
+    canvasStream = canvas.captureStream(targetFps);
+    const capturedVideoTrack = canvasStream.getVideoTracks()[0] as
       | (MediaStreamTrack & { requestFrame?: () => void })
       | undefined;
-    if (!capturedVideoTrack || typeof capturedVideoTrack.requestFrame !== 'function') {
-      canvasStream.getTracks().forEach((t) => t.stop());
-      canvasStream = canvas.captureStream(targetFps);
-      capturedVideoTrack = canvasStream.getVideoTracks()[0] as
-        | (MediaStreamTrack & { requestFrame?: () => void })
-        | undefined;
-    }
 
     if (dest && hasAudioTrack) {
       const audioTracks = dest.stream.getAudioTracks();
@@ -1606,12 +1655,8 @@ export async function processVideoItem(
       ? await selectWebCodecsVideoConfig(evenW, evenH, bps, targetFps)
       : null;
 
-    const nativeMp4Available = hasNativeMediaRecorderMp4();
-    // Prefer Hardware WebCodecs first (fastest on GPU); if GPU WebCodecs isn't available and browser
-    // natively supports fast MediaRecorder MP4, use MediaRecorder MP4 (~5-10x faster than CPU software WebCodecs).
-    const preferHardwareWebCodecs = Boolean(webCodecsSelection?.isHardwareAccelerated);
-
-    if (webCodecsSelection && (preferHardwareWebCodecs || !nativeMp4Available)) {
+    // Always use WebCodecs + mp4-muxer whenever supported to guarantee CFR Fast-Start MP4 without dropped frames
+    if (webCodecsSelection) {
       try {
         return await encodeMp4WithWebCodecs({
           item: resolvedItem,
@@ -1637,12 +1682,12 @@ export async function processVideoItem(
         }
         const msg = wcErr instanceof Error ? wcErr.message : '';
         if (msg !== 'WEBCODECS_UNAVAILABLE') {
-          console.warn('WebCodecs MP4 fallback para MediaRecorder MP4:', msg);
+          console.warn('WebCodecs MP4 fallback para MediaRecorder:', msg);
         }
       }
     }
 
-    // Native fast MediaRecorder MP4 (or last-resort fallback to software WebCodecs MP4 if MediaRecorder is not MP4)
+    // Legacy fallback only when WebCodecs is unavailable or failed
     try {
       return await encodeWithMediaRecorderFallback({
         item: resolvedItem,
