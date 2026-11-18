@@ -58,13 +58,17 @@ export const ExportSettingsPanel: React.FC<ExportSettingsPanelProps> = ({
         <Info className="w-4 h-4 text-cyan-400 flex-shrink-0 mt-0.5" />
         <div className="text-slate-300 leading-relaxed">
           <div>
-            Formato real gerado pelo seu navegador:{' '}
+            Formato de saída:{' '}
             <strong className="text-cyan-300 uppercase">.{detected.extension}</strong>{' '}
             <span className="text-slate-500 font-mono text-[11px]">({detected.mimeType})</span>
           </div>
-          {detected.extension === 'webm' && (
+          {detected.extension === 'mp4' ? (
             <p className="text-[11px] text-slate-400 mt-0.5">
-              O container WebM (VP8/Opus) é o formato nativo mais estável do navegador, com suporte total a reprodução e edição sem corromper o arquivo.
+              Exportação MP4 com taxa de quadros constante (CFR) e cabeçalho Fast-Start para reprodução fluida e sem travamentos em celulares e PC.
+            </p>
+          ) : (
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              Seu navegador atual não disponibilizou codificação MP4 nativa e usou o container WebM como alternativa de compatibilidade.
             </p>
           )}
         </div>

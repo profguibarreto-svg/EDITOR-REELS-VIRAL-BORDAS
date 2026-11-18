@@ -171,13 +171,25 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
 
     if (video && activeItemUrl && activeItem?.status !== 'error') {
       const start = trimStart;
-      const end = trimEnd > start ? trimEnd : video.duration || 10;
+      const effectiveDuration =
+        Number.isFinite(video.duration) && video.duration > 0
+          ? video.duration
+          : activeItem?.duration || 10;
+      const end = trimEnd > start ? Math.min(trimEnd, effectiveDuration) : effectiveDuration;
 
-      if (video.currentTime >= end || video.currentTime < start - 0.05) {
+      if (
+        !video.seeking &&
+        (video.ended ||
+          video.currentTime >= Math.max(start + 0.05, end - 0.02) ||
+          video.currentTime < start - 0.05)
+      ) {
         try {
           video.currentTime = start;
         } catch {
           // ignore
+        }
+        if (video.ended && isPlaying && video.paused) {
+          video.play().catch(() => {});
         }
       }
       if (timeDisplayRef.current) {
@@ -237,8 +249,7 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
     const renderLoop = () => {
       if (cancelled) return;
       drawSingleFrame();
-      const video = videoRef.current;
-      if (isPlaying && video && !video.paused && !video.ended) {
+      if (isPlaying && !cancelled && !isProcessing) {
         animId = requestAnimationFrame(renderLoop);
       }
     };
@@ -252,6 +263,19 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
       }
     };
   }, [isProcessing, isPlaying, activeItemUrl, activeItem?.status, drawSingleFrame, exportSettings.aspectRatio]);
+
+  const handleVideoEnded = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || !activeItemUrl) return;
+    try {
+      video.currentTime = trimStart;
+    } catch {
+      // ignore
+    }
+    if (isPlaying) {
+      video.play().catch(() => {});
+    }
+  }, [activeItemUrl, trimStart, isPlaying]);
 
   const togglePlay = () => {
     const video = videoRef.current;
@@ -296,10 +320,10 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
       : 405;
 
   const detectedFormat = getSupportedMimeType();
-  const outputLabel =
-    activeItem?.outputExtension === 'mp4' || activeItem?.outputBlob?.type.includes('mp4')
-      ? 'Baixar MP4 HD'
-      : 'Baixar WebM HD';
+  const isOutputWebm =
+    activeItem?.outputExtension === 'webm' ||
+    Boolean(activeItem?.outputBlob?.type.includes('webm'));
+  const outputLabel = isOutputWebm ? 'Baixar WebM HD' : 'Baixar MP4 HD';
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-lg flex flex-col items-center">
@@ -346,9 +370,21 @@ export const LiveCanvasPreview: React.FC<LiveCanvasPreviewProps> = ({
         muted
         loop
         crossOrigin="anonymous"
+        onLoadedMetadata={() => {
+          const v = videoRef.current;
+          if (v && trimStart > 0 && Math.abs(v.currentTime - trimStart) > 0.05) {
+            try {
+              v.currentTime = trimStart;
+            } catch {
+              // ignore
+            }
+          }
+          drawSingleFrame();
+        }}
         onLoadedData={drawSingleFrame}
         onCanPlay={drawSingleFrame}
         onSeeked={drawSingleFrame}
+        onEnded={handleVideoEnded}
         className="hidden"
       />
 
